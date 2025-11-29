@@ -1,0 +1,128 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r, include=FALSE}
+library(ggplot2)
+library(sqldf)
+library(dplyr)
+options(scipen=9999)
+```
+
+# Uring Mental Model for BM Performance (Throughput)
+
+We want to calculate the performance of each variant for our buffer manager in transactions per second.
+We assume the fn01 server with 3.7 GhZ, i.e., 3.7e9 cycles per second and our enterprise SSD with the following latencies.
+Another assumption is that we have a 0.7 probability of a hit miss (buffer size was 1GB).
+The workload is 100% update, meaning every read requires an eviction with SSD flush on average.
+
+```{r, include=TRUE}
+in_memory_tps <- 447726 # 100% update with RNG, including restarts
+disk_ratio <- 0.7
+
+clock <- 3.7e9
+us_per_sec <- 1e6
+
+read_lat_us <- 70
+write_lat_us <- 12
+
+txn_cycles <- clock / in_memory_tps
+
+read_one_clk <- 10200
+read_batch_clk <- 5400
+write_batch_clk <- 5700
+
+```
+
+## Synchronous BM
+
+The synchronous buffer manager is latency bound, since it blocks for every read / write.
+That means that the performance is simply the both latencies (1) read and (2) eviction in a second.
+
+```{r, include=TRUE}
+# We assume here latency bound for read and writes. 
+# Which we have in 2/3 of the cases.
+synchronous <- data.frame(
+  variant = "synchronous",
+  performance = us_per_sec / (disk_ratio * (read_lat_us + write_lat_us))
+)
+```
+
+## Batched Eviction
+
+Here, the assumption is that we can amortize away the latency of the eviction i.e., compatibility the write.
+
+```{r, include=TRUE}
+synchronous_batch_eviction <- data.frame(
+  variant = "synchronous_batch_evict",
+  performance = us_per_sec / (disk_ratio * read_lat_us)
+)
+```
+
+## Asynchronous (submit directly)
+
+With asynchronous version we will not be latency bound since we have enough concurrency to hide the latency.
+E.g. if we run with 32 coroutines, this means we are here rather CPU bound and must change our calculations.
+This is essentially little's law.
+Assumption is here 32 in-flight.
+
+```{r, include=TRUE}
+
+asynchronous_submit<- data.frame(
+  variant = "asynchronous_submit",
+  # This assumes that every co-routine submits directly for reads, 
+  # e.g., cannot batch, but for evictions we have one task.
+  performance = clock / (txn_cycles + disk_ratio * (read_one_clk + write_batch_clk))
+)
+```
+
+## Asynchronous (batching)
+
+```{r, include=TRUE}
+
+asynchronous_batch<- data.frame(
+  variant = "asynchronous_batch",
+  # This assumes that every co-routine waits with submission and we try to submit more.
+  performance = clock / (txn_cycles + disk_ratio * (read_batch_clk + write_batch_clk))
+)
+
+```
+
+## Expected Results
+
+```{r, echo=FALSE}
+df = synchronous
+df <- rbind(df, synchronous_batch_eviction)
+df <- rbind(df, asynchronous_submit)
+df <- rbind(df, asynchronous_batch) %>% mutate(type='model')
+
+# always submit with RNG in path 160342 vs 175191
+
+df <- rbind(df, read.csv(comment='#', text='
+variant,performance
+synchronous,16500
+synchronous_batch_evict,19100
+
+asynchronous_submit,183500
+asynchronous_batch,216600
+') %>% mutate(type='measured'))
+
+df$variant <- factor(
+  df$variant,
+  levels = c(
+    "synchronous",
+    "synchronous_batch_evict",
+    "asynchronous_submit",
+    "asynchronous_batch"
+  )
+)
+ggplot(df, aes(x=variant, y=performance, label=sprintf("%0.0f", performance), fill=type)) + 
+    geom_col(position=position_dodge()) + 
+    geom_text(vjust=0, position=position_dodge(width = .9)) +
+    theme_bw()
+```

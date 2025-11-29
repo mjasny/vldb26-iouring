@@ -1,0 +1,7 @@
+run,iopoll,duration,num_threads,ssd_size,batch_size,label,spiky,target_rate,kernel,mitigations,node
+0,False,10000,8,1073741824,8,Batchsize_8,False,1500000,6.15.0-rc7,True,fn01
+0,False,10000,8,1073741824,32,Batchsize_32,False,1500000,6.15.0-rc7,True,fn01
+0,False,10000,8,1073741824,128,Batchsize_128,False,1500000,6.15.0-rc7,True,fn01
+0,False,10000,8,1073741824,64,Batchsize_64,False,1500000,6.15.0-rc7,True,fn01
+0,False,10000,8,1073741824,1,Batchsize_1,False,1500000,6.15.0-rc7,True,fn01
+0,False,10000,8,1073741824,256,Batchsize_256,False,1500000,6.15.0-rc7,True,fn01

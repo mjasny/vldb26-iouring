@@ -1,0 +1,4199 @@
+From 8452a1a3fb10677bd30b3ac96c698f3a171b7265 Mon Sep 17 00:00:00 2001
+From: mjasny <matthias.jasny@cs.tu-darmstadt.de>
+Date: Mon, 10 Nov 2025 09:25:06 +0100
+Subject: [PATCH] uring opts
+
+---
+ .gitignore                                |    5 +
+ flake.lock                                |   61 +
+ flake.nix                                 |   51 +
+ lsyncd.conf.lua                           |   49 +
+ meson.build                               |    9 +-
+ src/backend/storage/aio/aio_init.c        |   40 +-
+ src/backend/storage/aio/method_io_uring.c | 1281 ++++++++++++---------
+ src/backend/storage/buffer/buf_init.c     |   25 +-
+ src/backend/storage/file/fd.c             |  777 ++++++-------
+ src/backend/storage/uring_config.h        |   89 ++
+ src/include/storage/aio.h                 |   71 +-
+ 11 files changed, 1399 insertions(+), 1059 deletions(-)
+ create mode 100644 flake.lock
+ create mode 100644 flake.nix
+ create mode 100644 lsyncd.conf.lua
+ create mode 100644 src/backend/storage/uring_config.h
+
+diff --git a/.gitignore b/.gitignore
+index 4e911395fe3..0294a747813 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,8 @@
++build/
++.cache/
++.vscode/
++subprojects/
++
+ # This file contains ignores for build artifacts from standard builds.
+ # Auxiliary files from local workflows, your preferred editor, etc. should
+ # be ignored locally using $GIT_DIR/info/exclude or ~/.gitexclude.
+diff --git a/flake.lock b/flake.lock
+new file mode 100644
+index 00000000000..2468070f754
+--- /dev/null
++++ b/flake.lock
+@@ -0,0 +1,61 @@
++{
++  "nodes": {
++    "flake-utils": {
++      "inputs": {
++        "systems": "systems"
++      },
++      "locked": {
++        "lastModified": 1731533236,
++        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
++        "owner": "numtide",
++        "repo": "flake-utils",
++        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
++        "type": "github"
++      },
++      "original": {
++        "owner": "numtide",
++        "repo": "flake-utils",
++        "type": "github"
++      }
++    },
++    "nixpkgs": {
++      "locked": {
++        "lastModified": 1735563628,
++        "narHash": "sha256-OnSAY7XDSx7CtDoqNh8jwVwh4xNL/2HaJxGjryLWzX8=",
++        "owner": "NixOS",
++        "repo": "nixpkgs",
++        "rev": "b134951a4c9f3c995fd7be05f3243f8ecd65d798",
++        "type": "github"
++      },
++      "original": {
++        "owner": "NixOS",
++        "ref": "nixos-24.05",
++        "repo": "nixpkgs",
++        "type": "github"
++      }
++    },
++    "root": {
++      "inputs": {
++        "flake-utils": "flake-utils",
++        "nixpkgs": "nixpkgs"
++      }
++    },
++    "systems": {
++      "locked": {
++        "lastModified": 1681028828,
++        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
++        "owner": "nix-systems",
++        "repo": "default",
++        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
++        "type": "github"
++      },
++      "original": {
++        "owner": "nix-systems",
++        "repo": "default",
++        "type": "github"
++      }
++    }
++  },
++  "root": "root",
++  "version": 7
++}
+diff --git a/flake.nix b/flake.nix
+new file mode 100644
+index 00000000000..98c8fd7a7eb
+--- /dev/null
++++ b/flake.nix
+@@ -0,0 +1,51 @@
++{
++  inputs = {
++    nixpkgs.url     = "github:NixOS/nixpkgs/nixos-24.05";
++    flake-utils.url = "github:numtide/flake-utils";
++  };
++
++  outputs = { self, nixpkgs, flake-utils, ... }:
++    flake-utils.lib.eachDefaultSystem (system:
++      let
++        pkgs = import nixpkgs { inherit system; };
++        haveNssWrapper = pkgs ? nss_wrapper;           # true on Linux, false on Darwin
++      in {
++        devShells.default = pkgs.mkShell {
++          # ⟨1⟩ all your postgres build deps …
++          packages = with pkgs; [
++            nss_wrapper
++            bison flex pkg-config perl python3 tcl
++            docbook-xsl-nons docbook_xml_dtd_45
++            readline zlib openssl libxml2 libxslt icu lz4 zstd
++            libuuid libkrb5 openldap linux-pam systemdLibs gettext
++          ] ++ pkgs.lib.optionals haveNssWrapper [ pkgs.nss_wrapper ];
++
++          shellHook = ''
++            if ! id -un >/dev/null 2>&1; then        # uid has no passwd entry
++              export LD_PRELOAD=${pkgs.nss_wrapper}/lib/libnss_wrapper.so
++              export NSS_WRAPPER_PASSWD=$(mktemp)
++              export NSS_WRAPPER_GROUP=$(mktemp)
++#              printf "pgdev:x:%d:%d::%s:/bin/sh\n" "$(id -u)" "$(id -g)" $HOME > $NSS_WRAPPER_PASSWD
++#              printf "pgdev:x:%d:\n" "$(id -g)" > $NSS_WRAPPER_GROUP
++#              echo "✨ Injected fake passwd entry for UID $(id -u)"
++               # passwd line: name, uid, gid
++               printf "pgdev:x:%d:%d::%s:/bin/sh\n" "$(id -u)" "$(id -g)" "$HOME" \
++                 > "$NSS_WRAPPER_PASSWD"
++
++               # PRIMARY group
++               printf "pgdev:x:%d:\n" "$(id -g)" > "$NSS_WRAPPER_GROUP"
++               # **NEW**: add every supplementary gid so ‘groups’ finds them
++               for gid in $(id -G); do
++                 printf "g%d:x:%d:\n" "$gid" "$gid" >> "$NSS_WRAPPER_GROUP"
++               done
++
++               echo "✨ Injected passwd/group entries for UID $(id -u)"
++            fi
++
++            # -- re-exec a full-featured Bash so the prompt & completion work -------
++            exec ${pkgs.bashInteractive}/bin/bash -l
++          '';
++        };
++      });
++}
++
+diff --git a/lsyncd.conf.lua b/lsyncd.conf.lua
+new file mode 100644
+index 00000000000..e1e22e723ec
+--- /dev/null
++++ b/lsyncd.conf.lua
+@@ -0,0 +1,49 @@
++settings {
++    nodaemon = true,
++}
++
++hosts = {
++    { ip = 'fn01',            port = 22 },
++}
++
++local filter = {
++    '- build/',
++    '- pgdata/',
++}
++
++local function findGitignoreFilters()
++    local cmd = "find . -type f -name '.gitignore'"
++    local p = io.popen(cmd)
++    local filters = {}
++    for line in p:lines() do
++        -- Format the path to be relative to the rsync source directory and prepend with "--filter=:- "
++        local filter = '--filter=:- ' .. line
++        table.insert(filters, filter)
++    end
++    p:close()
++    return filters
++end
++
++local targetdir = "./" .. io.popen("pwd"):read():match("([^/]-)$")
++local gitignoreFilters = findGitignoreFilters()
++
++
++
++for _, host in ipairs(hosts)
++do
++    sync {
++        default.rsyncssh,
++        source = ".",
++        targetdir = targetdir,
++        host = host.ip,
++        delay = 0,
++        ssh = {
++            port = host.port
++        },
++        rsync = {
++            perms = true,
++            --_extra = { table.unpack(gitignoreFilters) }
++        },
++        filter = filter,
++    }
++end
+diff --git a/meson.build b/meson.build
+index 5365aaf95e6..32367366666 100644
+--- a/meson.build
++++ b/meson.build
+@@ -992,14 +992,15 @@ endif
+ ###############################################################
+ 
+ liburingopt = get_option('liburing')
+-liburing = dependency('liburing', required: liburingopt)
++#liburing = dependency('liburing', required: liburingopt, fallback: ['liburing', 'liburing_dep'])
++liburing = subproject('liburing').get_variable('uring')
+ if liburing.found()
+   cdata.set('USE_LIBURING', 1)
+ 
+-  if cc.has_function('io_uring_queue_init_mem',
+-      dependencies: liburing, args: test_c_args)
++  #if cc.has_function('io_uring_queue_init_mem',
++      #     dependencies: liburing, args: test_c_args)
+     cdata.set('HAVE_LIBURING_QUEUE_INIT_MEM', 1)
+-  endif
++  #endif
+ 
+ endif
+ 
+diff --git a/src/backend/storage/aio/aio_init.c b/src/backend/storage/aio/aio_init.c
+index 885c3940c66..5876802a4c7 100644
+--- a/src/backend/storage/aio/aio_init.c
++++ b/src/backend/storage/aio/aio_init.c
+@@ -25,12 +25,10 @@
+ #include "storage/shmem.h"
+ #include "utils/guc.h"
+ 
+-
+-
+ static Size
+ AioCtlShmemSize(void)
+ {
+-	Size		sz;
++	Size sz;
+ 
+ 	/* pgaio_ctl itself */
+ 	sz = offsetof(PgAioCtl, io_handles);
+@@ -58,7 +56,7 @@ AioBackendShmemSize(void)
+ static Size
+ AioHandleShmemSize(void)
+ {
+-	Size		sz;
++	Size sz;
+ 
+ 	/* verify AioChooseMaxConcurrency() did its thing */
+ 	Assert(io_max_concurrency > 0);
+@@ -100,8 +98,8 @@ AioHandleDataShmemSize(void)
+ static int
+ AioChooseMaxConcurrency(void)
+ {
+-	uint32		max_backends;
+-	int			max_proportional_pins;
++	uint32 max_backends;
++	int max_proportional_pins;
+ 
+ 	/* Similar logic to LimitAdditionalPins() */
+ 	max_backends = MaxBackends + NUM_AUXILIARY_PROCS;
+@@ -113,10 +111,9 @@ AioChooseMaxConcurrency(void)
+ 	return Min(max_proportional_pins, 64);
+ }
+ 
+-Size
+-AioShmemSize(void)
++Size AioShmemSize(void)
+ {
+-	Size		sz = 0;
++	Size sz = 0;
+ 
+ 	/*
+ 	 * We prefer to report this value's source as PGC_S_DYNAMIC_DEFAULT.
+@@ -126,12 +123,12 @@ AioShmemSize(void)
+ 	 */
+ 	if (io_max_concurrency == -1)
+ 	{
+-		char		buf[32];
++		char buf[32];
+ 
+ 		snprintf(buf, sizeof(buf), "%d", AioChooseMaxConcurrency());
+ 		SetConfigOption("io_max_concurrency", buf, PGC_POSTMASTER,
+ 						PGC_S_DYNAMIC_DEFAULT);
+-		if (io_max_concurrency == -1)	/* failed to apply it? */
++		if (io_max_concurrency == -1) /* failed to apply it? */
+ 			SetConfigOption("io_max_concurrency", buf, PGC_POSTMASTER,
+ 							PGC_S_OVERRIDE);
+ 	}
+@@ -149,13 +146,12 @@ AioShmemSize(void)
+ 	return sz;
+ }
+ 
+-void
+-AioShmemInit(void)
++void AioShmemInit(void)
+ {
+-	bool		found;
+-	uint32		io_handle_off = 0;
+-	uint32		iovec_off = 0;
+-	uint32		per_backend_iovecs = io_max_concurrency * io_max_combine_limit;
++	bool found;
++	uint32 io_handle_off = 0;
++	uint32 iovec_off = 0;
++	uint32 per_backend_iovecs = io_max_concurrency * io_max_combine_limit;
+ 
+ 	pgaio_ctl = (PgAioCtl *)
+ 		ShmemInitStruct("AioCtl", AioCtlShmemSize(), &found);
+@@ -179,6 +175,11 @@ AioShmemInit(void)
+ 	pgaio_ctl->handle_data = (uint64 *)
+ 		ShmemInitStruct("AioHandleData", AioHandleDataShmemSize(), &found);
+ 
++	ereport(LOG, (errmsg("io handles: %d", pgaio_ctl->io_handle_count)));
++	ereport(LOG, (errmsg("iovec count: %d", pgaio_ctl->iovec_count)));
++	ereport(LOG, (errmsg("handle iov size: %d", AioHandleIOVShmemSize())));
++	ereport(LOG, (errmsg("handle data size: %d", AioHandleDataShmemSize()))); // just ids not actual data
++
+ 	for (int procno = 0; procno < AioProcs(); procno++)
+ 	{
+ 		PgAioBackend *bs = &pgaio_ctl->backend_state[procno];
+@@ -210,6 +211,8 @@ AioShmemInit(void)
+ 			dclist_push_tail(&bs->idle_ios, &ioh->node);
+ 			iovec_off += io_max_combine_limit;
+ 		}
++
++		// ereport(LOG, (errmsg("aioshmem init %d", procno)));
+ 	}
+ 
+ out:
+@@ -218,8 +221,7 @@ out:
+ 		pgaio_method_ops->shmem_init(!found);
+ }
+ 
+-void
+-pgaio_init_backend(void)
++void pgaio_init_backend(void)
+ {
+ 	/* shouldn't be initialized twice */
+ 	Assert(!pgaio_my_backend);
+diff --git a/src/backend/storage/aio/method_io_uring.c b/src/backend/storage/aio/method_io_uring.c
+index 0a8c054162f..c2389b5c0c0 100644
+--- a/src/backend/storage/aio/method_io_uring.c
++++ b/src/backend/storage/aio/method_io_uring.c
+@@ -37,44 +37,43 @@
+ #include "miscadmin.h"
+ #include "storage/aio_internal.h"
+ #include "storage/fd.h"
+-#include "storage/proc.h"
+-#include "storage/shmem.h"
+ #include "storage/lwlock.h"
++#include "storage/proc.h"
+ #include "storage/procnumber.h"
++#include "storage/shmem.h"
+ #include "utils/wait_event.h"
+ 
++#include "../uring_config.h"
+ 
+ /* number of completions processed at once */
+ #define PGAIO_MAX_LOCAL_COMPLETED_IO 32
+ 
+-
+ /* Entry points for IoMethodOps. */
+ static size_t pgaio_uring_shmem_size(void);
+ static void pgaio_uring_shmem_init(bool first_time);
+ static void pgaio_uring_init_backend(void);
+-static int	pgaio_uring_submit(uint16 num_staged_ios, PgAioHandle **staged_ios);
++static int pgaio_uring_submit(uint16 num_staged_ios, PgAioHandle **staged_ios);
+ static void pgaio_uring_wait_one(PgAioHandle *ioh, uint64 ref_generation);
+ 
+ /* helper functions */
+ static void pgaio_uring_sq_from_io(PgAioHandle *ioh, struct io_uring_sqe *sqe);
+ 
+-
+ const IoMethodOps pgaio_uring_ops = {
+-	/*
+-	 * While io_uring mostly is OK with FDs getting closed while the IO is in
+-	 * flight, that is not true for IOs submitted with IOSQE_ASYNC.
+-	 *
+-	 * See
+-	 * https://postgr.es/m/5ons2rtmwarqqhhexb3dnqulw5rjgwgoct57vpdau4rujlrffj%403fls6d2mkiwc
+-	 */
+-	.wait_on_fd_before_close = true,
+-
+-	.shmem_size = pgaio_uring_shmem_size,
+-	.shmem_init = pgaio_uring_shmem_init,
+-	.init_backend = pgaio_uring_init_backend,
+-
+-	.submit = pgaio_uring_submit,
+-	.wait_one = pgaio_uring_wait_one,
++    /*
++     * While io_uring mostly is OK with FDs getting closed while the IO is in
++     * flight, that is not true for IOs submitted with IOSQE_ASYNC.
++     *
++     * See
++     * https://postgr.es/m/5ons2rtmwarqqhhexb3dnqulw5rjgwgoct57vpdau4rujlrffj%403fls6d2mkiwc
++     */
++    .wait_on_fd_before_close = true,
++
++    .shmem_size = pgaio_uring_shmem_size,
++    .shmem_init = pgaio_uring_shmem_init,
++    .init_backend = pgaio_uring_init_backend,
++
++    .submit = pgaio_uring_submit,
++    .wait_one = pgaio_uring_wait_one,
+ };
+ 
+ /*
+@@ -83,18 +82,17 @@ const IoMethodOps pgaio_uring_ops = {
+  * Align the whole struct to a cacheline boundary, to prevent false sharing
+  * between completion_lock and prior backend's io_uring_ring.
+  */
+-typedef struct pg_attribute_aligned (PG_CACHE_LINE_SIZE)
+-PgAioUringContext
++typedef struct pg_attribute_aligned(PG_CACHE_LINE_SIZE) PgAioUringContext
+ {
+-	/*
+-	 * Multiple backends can process completions for this backend's io_uring
+-	 * instance (e.g. when the backend issuing IO is busy doing something
+-	 * else).  To make that safe we have to ensure that only a single backend
+-	 * gets io completions from the io_uring instance at a time.
+-	 */
+-	LWLock		completion_lock;
+-
+-	struct io_uring io_uring_ring;
++  /*
++   * Multiple backends can process completions for this backend's io_uring
++   * instance (e.g. when the backend issuing IO is busy doing something
++   * else).  To make that safe we have to ensure that only a single backend
++   * gets io completions from the io_uring instance at a time.
++   */
++  LWLock completion_lock;
++
++  struct io_uring io_uring_ring;
+ } PgAioUringContext;
+ 
+ /*
+@@ -106,608 +104,763 @@ PgAioUringContext
+  */
+ typedef struct PgAioUringCaps
+ {
+-	bool		checked;
+-	/* -1 if io_uring_queue_init_mem() is unsupported */
+-	int			mem_init_size;
++  bool checked;
++  /* -1 if io_uring_queue_init_mem() is unsupported */
++  int mem_init_size;
+ } PgAioUringCaps;
+ 
+-
+ /* PgAioUringContexts for all backends */
+ static PgAioUringContext *pgaio_uring_contexts;
+ 
+ /* the current backend's context */
+ static PgAioUringContext *pgaio_my_uring_context;
+ 
+-static PgAioUringCaps pgaio_uring_caps =
+-{
+-	.checked = false,
+-	.mem_init_size = -1,
++static PgAioUringCaps pgaio_uring_caps = {
++    .checked = false,
++    .mem_init_size = -1,
+ };
+ 
+-static uint32
+-pgaio_uring_procs(void)
++static uint32 pgaio_uring_procs(void)
+ {
+-	/*
+-	 * We can subtract MAX_IO_WORKERS here as io workers are never used at the
+-	 * same time as io_method=io_uring.
+-	 */
+-	return MaxBackends + NUM_AUXILIARY_PROCS - MAX_IO_WORKERS;
++  /*
++   * We can subtract MAX_IO_WORKERS here as io workers are never used at the
++   * same time as io_method=io_uring.
++   */
++  return MaxBackends + NUM_AUXILIARY_PROCS - MAX_IO_WORKERS;
+ }
+ 
+ /*
+  * Initializes pgaio_uring_caps, unless that's already done.
+  */
+-static void
+-pgaio_uring_check_capabilities(void)
++static void pgaio_uring_check_capabilities(void)
+ {
+-	if (pgaio_uring_caps.checked)
+-		return;
+-
+-	/*
+-	 * By default io_uring creates a shared memory mapping for each io_uring
+-	 * instance, leading to a large number of memory mappings. Unfortunately a
+-	 * large number of memory mappings slows things down, backend exit is
+-	 * particularly affected.  To address that, newer kernels (6.5) support
+-	 * using user-provided memory for the memory, by putting the relevant
+-	 * memory into shared memory we don't need any additional mappings.
+-	 *
+-	 * To know whether this is supported, we unfortunately need to probe the
+-	 * kernel by trying to create a ring with userspace-provided memory. This
+-	 * also has a secondary benefit: We can determine precisely how much
+-	 * memory we need for each io_uring instance.
+-	 */
++  if (pgaio_uring_caps.checked)
++    return;
++
++  /*
++   * By default io_uring creates a shared memory mapping for each io_uring
++   * instance, leading to a large number of memory mappings. Unfortunately a
++   * large number of memory mappings slows things down, backend exit is
++   * particularly affected.  To address that, newer kernels (6.5) support
++   * using user-provided memory for the memory, by putting the relevant
++   * memory into shared memory we don't need any additional mappings.
++   *
++   * To know whether this is supported, we unfortunately need to probe the
++   * kernel by trying to create a ring with userspace-provided memory. This
++   * also has a secondary benefit: We can determine precisely how much
++   * memory we need for each io_uring instance.
++   */
+ #if defined(HAVE_LIBURING_QUEUE_INIT_MEM) && defined(IORING_SETUP_NO_MMAP)
+-	{
+-		struct io_uring test_ring;
+-		size_t		ring_size;
+-		void	   *ring_ptr;
+-		struct io_uring_params p = {0};
+-		int			ret;
+-
+-		/*
+-		 * Liburing does not yet provide an API to query how much memory a
+-		 * ring will need. So we over-estimate it here. As the memory is freed
+-		 * just below that's small temporary waste of memory.
+-		 *
+-		 * 1MB is more than enough for rings within io_max_concurrency's
+-		 * range.
+-		 */
+-		ring_size = 1024 * 1024;
+-
+-		/*
+-		 * Hard to believe a system exists where 1MB would not be a multiple
+-		 * of the page size. But it's cheap to ensure...
+-		 */
+-		ring_size -= ring_size % sysconf(_SC_PAGESIZE);
+-
+-		ring_ptr = mmap(NULL, ring_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+-		if (ring_ptr == MAP_FAILED)
+-			elog(ERROR,
+-				 "mmap(%zu) to determine io_uring_queue_init_mem() support failed: %m",
+-				 ring_size);
+-
+-		ret = io_uring_queue_init_mem(io_max_concurrency, &test_ring, &p, ring_ptr, ring_size);
+-		if (ret > 0)
+-		{
+-			pgaio_uring_caps.mem_init_size = ret;
+-
+-			elog(DEBUG1,
+-				 "can use combined memory mapping for io_uring, each ring needs %d bytes",
+-				 ret);
+-
+-			/* clean up the created ring, it was just for a test */
+-			io_uring_queue_exit(&test_ring);
+-		}
+-		else
+-		{
+-			/*
+-			 * There are different reasons for ring creation to fail, but it's
+-			 * ok to treat that just as io_uring_queue_init_mem() not being
+-			 * supported. We'll report a more detailed error in
+-			 * pgaio_uring_shmem_init().
+-			 */
+-			errno = -ret;
+-			elog(DEBUG1,
+-				 "cannot use combined memory mapping for io_uring, ring creation failed: %m");
+-
+-		}
+-
+-		if (munmap(ring_ptr, ring_size) != 0)
+-			elog(ERROR, "munmap() failed: %m");
+-	}
++  {
++    struct io_uring test_ring;
++    size_t ring_size;
++    void *ring_ptr;
++    struct io_uring_params p = {0};
++    int ret;
++
++    /*
++     * Liburing does not yet provide an API to query how much memory a
++     * ring will need. So we over-estimate it here. As the memory is freed
++     * just below that's small temporary waste of memory.
++     *
++     * 1MB is more than enough for rings within io_max_concurrency's
++     * range.
++     */
++    ring_size = 1024 * 1024;
++
++    /*
++     * Hard to believe a system exists where 1MB would not be a multiple
++     * of the page size. But it's cheap to ensure...
++     */
++    ring_size -= ring_size % sysconf(_SC_PAGESIZE);
++
++    ring_ptr = mmap(NULL, ring_size, PROT_READ | PROT_WRITE,
++                    MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++    if (ring_ptr == MAP_FAILED)
++      elog(
++          ERROR,
++          "mmap(%zu) to determine io_uring_queue_init_mem() support failed: %m",
++          ring_size);
++
++    ret = io_uring_queue_init_mem(io_max_concurrency, &test_ring, &p, ring_ptr,
++                                  ring_size);
++    if (ret > 0)
++    {
++      pgaio_uring_caps.mem_init_size = ret;
++
++      elog(DEBUG1,
++           "can use combined memory mapping for io_uring, each ring needs %d "
++           "bytes",
++           ret);
++
++      /* clean up the created ring, it was just for a test */
++      io_uring_queue_exit(&test_ring);
++    }
++    else
++    {
++      /*
++       * There are different reasons for ring creation to fail, but it's
++       * ok to treat that just as io_uring_queue_init_mem() not being
++       * supported. We'll report a more detailed error in
++       * pgaio_uring_shmem_init().
++       */
++      errno = -ret;
++      elog(DEBUG1, "cannot use combined memory mapping for io_uring, ring "
++                   "creation failed: %m");
++    }
++
++    if (munmap(ring_ptr, ring_size) != 0)
++      elog(ERROR, "munmap() failed: %m");
++  }
+ #else
+-	{
+-		elog(DEBUG1,
+-			 "can't use combined memory mapping for io_uring, kernel or liburing too old");
+-	}
++  {
++    elog(DEBUG1, "can't use combined memory mapping for io_uring, kernel or "
++                 "liburing too old");
++  }
+ #endif
+ 
+-	pgaio_uring_caps.checked = true;
++  pgaio_uring_caps.checked = true;
+ }
+ 
+ /*
+  * Memory for all PgAioUringContext instances
+  */
+-static size_t
+-pgaio_uring_context_shmem_size(void)
++static size_t pgaio_uring_context_shmem_size(void)
+ {
+-	return mul_size(pgaio_uring_procs(), sizeof(PgAioUringContext));
++  return mul_size(pgaio_uring_procs(), sizeof(PgAioUringContext));
+ }
+ 
+ /*
+  * Memory for the combined memory used by io_uring instances. Returns 0 if
+  * that is not supported by kernel/liburing.
+  */
+-static size_t
+-pgaio_uring_ring_shmem_size(void)
++static size_t pgaio_uring_ring_shmem_size(void)
+ {
+-	size_t		sz = 0;
+-
+-	if (pgaio_uring_caps.mem_init_size > 0)
+-	{
+-		/*
+-		 * Memory for rings needs to be allocated to the page boundary,
+-		 * reserve space. Luckily it does not need to be aligned to hugepage
+-		 * boundaries, even if huge pages are used.
+-		 */
+-		sz = add_size(sz, sysconf(_SC_PAGESIZE));
+-		sz = add_size(sz, mul_size(pgaio_uring_procs(),
+-								   pgaio_uring_caps.mem_init_size));
+-	}
+-
+-	return sz;
++  size_t sz = 0;
++
++  if (pgaio_uring_caps.mem_init_size > 0)
++  {
++    /*
++     * Memory for rings needs to be allocated to the page boundary,
++     * reserve space. Luckily it does not need to be aligned to hugepage
++     * boundaries, even if huge pages are used.
++     */
++    sz = add_size(sz, sysconf(_SC_PAGESIZE));
++    sz = add_size(
++        sz, mul_size(pgaio_uring_procs(), pgaio_uring_caps.mem_init_size));
++  }
++
++  return sz;
+ }
+ 
+-static size_t
+-pgaio_uring_shmem_size(void)
++static size_t pgaio_uring_shmem_size(void)
+ {
+-	size_t		sz;
++  size_t sz;
+ 
+-	/*
+-	 * Kernel and liburing support for various features influences how much
+-	 * shmem we need, perform the necessary checks.
+-	 */
+-	pgaio_uring_check_capabilities();
++  /*
++   * Kernel and liburing support for various features influences how much
++   * shmem we need, perform the necessary checks.
++   */
++  pgaio_uring_check_capabilities();
+ 
+-	sz = pgaio_uring_context_shmem_size();
+-	sz = add_size(sz, pgaio_uring_ring_shmem_size());
++  sz = pgaio_uring_context_shmem_size();
++  sz = add_size(sz, pgaio_uring_ring_shmem_size());
+ 
+-	return sz;
++  return sz;
+ }
+ 
+-static void
+-pgaio_uring_shmem_init(bool first_time)
++#include "storage/bufmgr.h"
++
++#if FIXED_FDS
++const char *file_paths[] = {
++    "global/1260",
++    "global/1262",
++    "base/5/1259",
++    "base/5/1249",
++    "base/5/2610",
++    "base/5/2601",
++    "base/5/2616",
++    "base/5/2603",
++    "base/5/1259",
++    "base/5/16384",
++    "base/5/16384.1",
++    "base/5/16384.2",
++    "base/5/16384.3",
++    "base/5/16384.4",
++    "base/5/16384.5",
++    "base/5/16384.6",
++    "base/5/16384.7",
++    "base/5/16384.8",
++    "base/5/16384.9",
++    "base/5/16384.10",
++    "base/5/16384.11",
++    "base/5/16384.12",
++    "base/5/16384.13",
++    "base/5/16384.14",
++    "base/5/16384.15",
++    "base/5/16384.16",
++    "base/5/16384.17",
++    "base/5/16384.18",
++    "base/5/16384.19",
++    "base/5/16384.20",
++    "base/5/16384.21",
++    "base/5/16384.22",
++    "base/5/16384.23",
++    "base/5/16384.24",
++    "base/5/16384.25",
++    "base/5/16384.26",
++    "base/5/16384.27",
++    "base/5/16384.28",
++    "base/5/16384.29",
++    "base/5/16384.30",
++    "base/5/16384.31",
++    "base/5/16384.32",
++    "base/5/16384.33",
++};
++const int num_files = sizeof(file_paths) / sizeof(file_paths[0]);
++int fd_to_idx[300] = {[0 ... 299] = -1};
++#endif
++
++static void pgaio_uring_shmem_init(bool first_time)
+ {
+-	int			TotalProcs = pgaio_uring_procs();
+-	bool		found;
+-	char	   *shmem;
+-	size_t		ring_mem_remain = 0;
+-	char	   *ring_mem_next = 0;
+-
+-	/*
+-	 * We allocate memory for all PgAioUringContext instances and, if
+-	 * supported, the memory required for each of the io_uring instances, in
+-	 * one ShmemInitStruct().
+-	 */
+-	shmem = ShmemInitStruct("AioUringContext", pgaio_uring_shmem_size(), &found);
+-	if (found)
+-		return;
+-
+-	pgaio_uring_contexts = (PgAioUringContext *) shmem;
+-	shmem += pgaio_uring_context_shmem_size();
+-
+-	/* if supported, handle memory alignment / sizing for io_uring memory */
+-	if (pgaio_uring_caps.mem_init_size > 0)
+-	{
+-		ring_mem_remain = pgaio_uring_ring_shmem_size();
+-		ring_mem_next = (char *) shmem;
+-
+-		/* align to page boundary, see also pgaio_uring_ring_shmem_size() */
+-		ring_mem_next = (char *) TYPEALIGN(sysconf(_SC_PAGESIZE), ring_mem_next);
+-
+-		/* account for alignment */
+-		ring_mem_remain -= ring_mem_next - shmem;
+-		shmem += ring_mem_next - shmem;
+-
+-		shmem += ring_mem_remain;
+-	}
+-
+-	for (int contextno = 0; contextno < TotalProcs; contextno++)
+-	{
+-		PgAioUringContext *context = &pgaio_uring_contexts[contextno];
+-		int			ret;
+-
+-		/*
+-		 * Right now a high TotalProcs will cause problems in two ways:
+-		 *
+-		 * - RLIMIT_NOFILE needs to be big enough to allow all
+-		 * io_uring_queue_init() calls to succeed.
+-		 *
+-		 * - RLIMIT_NOFILE needs to be big enough to still have enough file
+-		 * descriptors to satisfy set_max_safe_fds() left over. Or, even
+-		 * better, have max_files_per_process left over FDs.
+-		 *
+-		 * We probably should adjust the soft RLIMIT_NOFILE to ensure that.
+-		 *
+-		 *
+-		 * XXX: Newer versions of io_uring support sharing the workers that
+-		 * execute some asynchronous IOs between io_uring instances. It might
+-		 * be worth using that - also need to evaluate if that causes
+-		 * noticeable additional contention?
+-		 */
+-
+-		/*
+-		 * If supported (c.f. pgaio_uring_check_capabilities()), create ring
+-		 * with its data in shared memory. Otherwise fall back io_uring
+-		 * creating a memory mapping for each ring.
+-		 */
++  int TotalProcs = pgaio_uring_procs();
++  bool found;
++  char *shmem;
++  size_t ring_mem_remain = 0;
++  char *ring_mem_next = 0;
++
++  /*
++   * We allocate memory for all PgAioUringContext instances and, if
++   * supported, the memory required for each of the io_uring instances, in
++   * one ShmemInitStruct().
++   */
++  shmem = ShmemInitStruct("AioUringContext", pgaio_uring_shmem_size(), &found);
++  if (found)
++    return;
++
++  pgaio_uring_contexts = (PgAioUringContext *)shmem;
++  shmem += pgaio_uring_context_shmem_size();
++
++  /* if supported, handle memory alignment / sizing for io_uring memory */
++  if (pgaio_uring_caps.mem_init_size > 0)
++  {
++    ring_mem_remain = pgaio_uring_ring_shmem_size();
++    ring_mem_next = (char *)shmem;
++
++    /* align to page boundary, see also pgaio_uring_ring_shmem_size() */
++    ring_mem_next = (char *)TYPEALIGN(sysconf(_SC_PAGESIZE), ring_mem_next);
++
++    /* account for alignment */
++    ring_mem_remain -= ring_mem_next - shmem;
++    shmem += ring_mem_next - shmem;
++
++    shmem += ring_mem_remain;
++  }
++
++  for (int contextno = 0; contextno < TotalProcs; contextno++)
++  {
++    PgAioUringContext *context = &pgaio_uring_contexts[contextno];
++    int ret;
++
++    /*
++     * Right now a high TotalProcs will cause problems in two ways:
++     *
++     * - RLIMIT_NOFILE needs to be big enough to allow all
++     * io_uring_queue_init() calls to succeed.
++     *
++     * - RLIMIT_NOFILE needs to be big enough to still have enough file
++     * descriptors to satisfy set_max_safe_fds() left over. Or, even
++     * better, have max_files_per_process left over FDs.
++     *
++     * We probably should adjust the soft RLIMIT_NOFILE to ensure that.
++     *
++     *
++     * XXX: Newer versions of io_uring support sharing the workers that
++     * execute some asynchronous IOs between io_uring instances. It might
++     * be worth using that - also need to evaluate if that causes
++     * noticeable additional contention?
++     */
++
++    /*
++     * If supported (c.f. pgaio_uring_check_capabilities()), create ring
++     * with its data in shared memory. Otherwise fall back io_uring
++     * creating a memory mapping for each ring.
++     */
+ #if defined(HAVE_LIBURING_QUEUE_INIT_MEM) && defined(IORING_SETUP_NO_MMAP)
+-		if (pgaio_uring_caps.mem_init_size > 0)
+-		{
+-			struct io_uring_params p = {0};
++    if (pgaio_uring_caps.mem_init_size > 0)
++    {
++      struct io_uring_params p = {0};
++
++#if IO_POLL
++      p.flags |= IORING_SETUP_IOPOLL;
++#endif
++
++      // p.flags |= IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_SINGLE_ISSUER;
++
++#if SETUP_MODE == SETUP_COOP
+ 
+-			ret = io_uring_queue_init_mem(io_max_concurrency, &context->io_uring_ring, &p, ring_mem_next, ring_mem_remain);
++      p.flags |= IORING_SETUP_COOP_TASKRUN;
+ 
+-			ring_mem_remain -= ret;
+-			ring_mem_next += ret;
+-		}
+-		else
++#elif SETUP_MODE == SETUP_SQPOLL
++
++      p.flags |= IORING_SETUP_SQPOLL;
++      p.sq_thread_idle = 100;
++      // p.sq_thread_cpu = cfg.core_id + 1;
++      // p.flags |= IORING_SETUP_SQ_AFF;
++
++#if SHARE_SQ
++      if (contextno > 0)
++      {
++        p.wq_fd = pgaio_uring_contexts[0].io_uring_ring.ring_fd;
++        p.flags |= IORING_SETUP_ATTACH_WQ;
++      }
++#endif
++#endif
++
++      ret = io_uring_queue_init_mem(io_max_concurrency, &context->io_uring_ring,
++                                    &p, ring_mem_next, ring_mem_remain);
++
++      ring_mem_remain -= ret;
++      ring_mem_next += ret;
++      if (contextno < 5)
++      {
++        ereport(LOG, (errmsg("mmap queue init %d", contextno)));
++      }
++    }
++    else
++#endif
++    {
++      ret = io_uring_queue_init(io_max_concurrency, &context->io_uring_ring, 0);
++    }
++
++    if (ret < 0)
++    {
++      char *hint = NULL;
++      int err = ERRCODE_INTERNAL_ERROR;
++
++      /* add hints for some failures that errno explains sufficiently */
++      if (-ret == EPERM)
++      {
++        err = ERRCODE_INSUFFICIENT_PRIVILEGE;
++        hint = _("Check if io_uring is disabled via "
++                 "/proc/sys/kernel/io_uring_disabled.");
++      }
++      else if (-ret == EMFILE)
++      {
++        err = ERRCODE_INSUFFICIENT_RESOURCES;
++        hint = psprintf(_("Consider increasing \"ulimit -n\" to at least %d."),
++                        TotalProcs + max_files_per_process);
++      }
++      else if (-ret == ENOSYS)
++      {
++        err = ERRCODE_FEATURE_NOT_SUPPORTED;
++        hint = _("Kernel does not support io_uring.");
++      }
++
++      /* update errno to allow %m to work */
++      errno = -ret;
++
++      ereport(ERROR, errcode(err), errmsg("could not setup io_uring queue: %m"),
++              hint != NULL ? errhint("%s", hint) : 0);
++    }
++
++#if FIXED_BUFS
++    {
++
++      struct iovec iovec = {.iov_base = BufferBlocks, .iov_len = NBuffers * BLCKSZ};
++      int rc = io_uring_register_buffers(&context->io_uring_ring, &iovec, 1);
++      if (rc != 0)
++      {
++        ereport(ERROR, (errmsg("register buffers ret: %d", ret)));
++      }
++
++      rc = io_uring_register_files_sparse(&context->io_uring_ring, 64);
++      if (rc != 0)
++      {
++        ereport(ERROR, (errmsg("register files ret: %d", rc)));
++      }
++
++      // for (int i = 0; i < num_files; i++)
++      //{
++
++      //  struct io_uring_sqe *sqe = io_uring_get_sqe(&context->io_uring_ring);
++      //  io_uring_prep_open_direct(sqe, file_paths[i], O_RDWR, 540674, i);
++      //  io_uring_sqe_set_data64(sqe, 42);
++      //  io_uring_submit(&context->io_uring_ring);
++
++      //  struct io_uring_cqe *cqe;
++      //  io_uring_wait_cqe(&context->io_uring_ring, &cqe);
++      //  if (cqe->res < 0)
++      //  {
++      //    fprintf(stderr, "cqe ud=%llu res %d %s\n", cqe->user_data, cqe->res, strerror(-cqe->res));
++      //    exit(1);
++      //  }
++      //  io_uring_cqe_seen(&context->io_uring_ring, cqe);
++      //}
++    }
++#endif
++
++    LWLockInitialize(&context->completion_lock, LWTRANCHE_AIO_URING_COMPLETION);
++  }
++
++#if FIXED_FDS
++  // move outside to avoid too many open files
++  for (int i = 0; i < num_files; i++)
++  {
++    int fd = open(file_paths[i], 540674);
++    for (int contextno = 0; contextno < TotalProcs; contextno++)
++    {
++      PgAioUringContext *context = &pgaio_uring_contexts[contextno];
++      int rc = io_uring_register_files_update(&context->io_uring_ring, /*off*/ i, &fd, 1);
++      if (rc < 0)
++      {
++        ereport(ERROR, (errmsg("register files update ret: %d %s", rc, strerror(rc))));
++      }
++    }
++  }
+ #endif
+-		{
+-			ret = io_uring_queue_init(io_max_concurrency, &context->io_uring_ring, 0);
+-		}
+-
+-		if (ret < 0)
+-		{
+-			char	   *hint = NULL;
+-			int			err = ERRCODE_INTERNAL_ERROR;
+-
+-			/* add hints for some failures that errno explains sufficiently */
+-			if (-ret == EPERM)
+-			{
+-				err = ERRCODE_INSUFFICIENT_PRIVILEGE;
+-				hint = _("Check if io_uring is disabled via /proc/sys/kernel/io_uring_disabled.");
+-			}
+-			else if (-ret == EMFILE)
+-			{
+-				err = ERRCODE_INSUFFICIENT_RESOURCES;
+-				hint = psprintf(_("Consider increasing \"ulimit -n\" to at least %d."),
+-								TotalProcs + max_files_per_process);
+-			}
+-			else if (-ret == ENOSYS)
+-			{
+-				err = ERRCODE_FEATURE_NOT_SUPPORTED;
+-				hint = _("Kernel does not support io_uring.");
+-			}
+-
+-			/* update errno to allow %m to work */
+-			errno = -ret;
+-
+-			ereport(ERROR,
+-					errcode(err),
+-					errmsg("could not setup io_uring queue: %m"),
+-					hint != NULL ? errhint("%s", hint) : 0);
+-		}
+-
+-		LWLockInitialize(&context->completion_lock, LWTRANCHE_AIO_URING_COMPLETION);
+-	}
++
++  ereport(LOG, (errmsg("BufferBlocks: %p", BufferBlocks)));
++  ereport(LOG, (errmsg("NBuffers %d start: %p", NBuffers, (void *)BufferBlocks)));
+ }
+ 
+-static void
+-pgaio_uring_init_backend(void)
++static void pgaio_uring_init_backend(void)
+ {
+-	Assert(MyProcNumber < pgaio_uring_procs());
++  Assert(MyProcNumber < pgaio_uring_procs());
+ 
+-	pgaio_my_uring_context = &pgaio_uring_contexts[MyProcNumber];
++  pgaio_my_uring_context = &pgaio_uring_contexts[MyProcNumber];
+ }
+ 
+-static int
+-pgaio_uring_submit(uint16 num_staged_ios, PgAioHandle **staged_ios)
++static int pgaio_uring_submit(uint16 num_staged_ios, PgAioHandle **staged_ios)
+ {
+-	struct io_uring *uring_instance = &pgaio_my_uring_context->io_uring_ring;
+-	int			in_flight_before = dclist_count(&pgaio_my_backend->in_flight_ios);
+-
+-	Assert(num_staged_ios <= PGAIO_SUBMIT_BATCH_SIZE);
+-
+-	for (int i = 0; i < num_staged_ios; i++)
+-	{
+-		PgAioHandle *ioh = staged_ios[i];
+-		struct io_uring_sqe *sqe;
+-
+-		sqe = io_uring_get_sqe(uring_instance);
+-
+-		if (!sqe)
+-			elog(ERROR, "io_uring submission queue is unexpectedly full");
+-
+-		pgaio_io_prepare_submit(ioh);
+-		pgaio_uring_sq_from_io(ioh, sqe);
+-
+-		/*
+-		 * io_uring executes IO in process context if possible. That's
+-		 * generally good, as it reduces context switching. When performing a
+-		 * lot of buffered IO that means that copying between page cache and
+-		 * userspace memory happens in the foreground, as it can't be
+-		 * offloaded to DMA hardware as is possible when using direct IO. When
+-		 * executing a lot of buffered IO this causes io_uring to be slower
+-		 * than worker mode, as worker mode parallelizes the copying. io_uring
+-		 * can be told to offload work to worker threads instead.
+-		 *
+-		 * If an IO is buffered IO and we already have IOs in flight or
+-		 * multiple IOs are being submitted, we thus tell io_uring to execute
+-		 * the IO in the background. We don't do so for the first few IOs
+-		 * being submitted as executing in this process' context has lower
+-		 * latency.
+-		 */
+-		if (in_flight_before > 4 && (ioh->flags & PGAIO_HF_BUFFERED))
+-			io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
+-
+-		in_flight_before++;
+-	}
+-
+-	while (true)
+-	{
+-		int			ret;
+-
+-		pgstat_report_wait_start(WAIT_EVENT_AIO_IO_URING_SUBMIT);
+-		ret = io_uring_submit(uring_instance);
+-		pgstat_report_wait_end();
+-
+-		if (ret == -EINTR)
+-		{
+-			pgaio_debug(DEBUG3,
+-						"aio method uring: submit EINTR, nios: %d",
+-						num_staged_ios);
+-		}
+-		else if (ret < 0)
+-		{
+-			/*
+-			 * The io_uring_enter() manpage suggests that the appropriate
+-			 * reaction to EAGAIN is:
+-			 *
+-			 * "The application should wait for some completions and try
+-			 * again"
+-			 *
+-			 * However, it seems unlikely that that would help in our case, as
+-			 * we apply a low limit to the number of outstanding IOs and thus
+-			 * also outstanding completions, making it unlikely that we'd get
+-			 * EAGAIN while the OS is in good working order.
+-			 *
+-			 * Additionally, it would be problematic to just wait here, our
+-			 * caller might hold critical locks. It'd possibly lead to
+-			 * delaying the crash-restart that seems likely to occur when the
+-			 * kernel is under such heavy memory pressure.
+-			 *
+-			 * Update errno to allow %m to work.
+-			 */
+-			errno = -ret;
+-			elog(PANIC, "io_uring submit failed: %m");
+-		}
+-		else if (ret != num_staged_ios)
+-		{
+-			/* likely unreachable, but if it is, we would need to re-submit */
+-			elog(PANIC, "io_uring submit submitted only %d of %d",
+-				 ret, num_staged_ios);
+-		}
+-		else
+-		{
+-			pgaio_debug(DEBUG4,
+-						"aio method uring: submitted %d IOs",
+-						num_staged_ios);
+-			break;
+-		}
+-	}
+-
+-	return num_staged_ios;
++  struct io_uring *uring_instance = &pgaio_my_uring_context->io_uring_ring;
++  int in_flight_before = dclist_count(&pgaio_my_backend->in_flight_ios);
++
++  Assert(num_staged_ios <= PGAIO_SUBMIT_BATCH_SIZE);
++
++  for (int i = 0; i < num_staged_ios; i++)
++  {
++    PgAioHandle *ioh = staged_ios[i];
++    struct io_uring_sqe *sqe;
++
++    sqe = io_uring_get_sqe(uring_instance);
++
++    if (!sqe)
++      elog(ERROR, "io_uring submission queue is unexpectedly full");
++
++    pgaio_io_prepare_submit(ioh);
++    pgaio_uring_sq_from_io(ioh, sqe);
++
++/*
++ * io_uring executes IO in process context if possible. That's
++ * generally good, as it reduces context switching. When performing a
++ * lot of buffered IO that means that copying between page cache and
++ * userspace memory happens in the foreground, as it can't be
++ * offloaded to DMA hardware as is possible when using direct IO. When
++ * executing a lot of buffered IO this causes io_uring to be slower
++ * than worker mode, as worker mode parallelizes the copying. io_uring
++ * can be told to offload work to worker threads instead.
++ *
++ * If an IO is buffered IO and we already have IOs in flight or
++ * multiple IOs are being submitted, we thus tell io_uring to execute
++ * the IO in the background. We don't do so for the first few IOs
++ * being submitted as executing in this process' context has lower
++ * latency.
++ */
++#if !FIXED_BUFS
++    if (in_flight_before > 4 && (ioh->flags & PGAIO_HF_BUFFERED))
++    {
++      io_uring_sqe_set_flags(sqe, IOSQE_ASYNC);
++      ereport(LOG, (errmsg("IOSQE_ASYNC io async inflight: %d", in_flight_before)));
++    }
++#endif
++
++    in_flight_before++;
++  }
++
++  while (true)
++  {
++    int ret;
++
++    pgstat_report_wait_start(WAIT_EVENT_AIO_IO_URING_SUBMIT);
++    ret = io_uring_submit(uring_instance);
++    pgstat_report_wait_end();
++
++    if (ret == -EINTR)
++    {
++      pgaio_debug(DEBUG3, "aio method uring: submit EINTR, nios: %d",
++                  num_staged_ios);
++    }
++    else if (ret < 0)
++    {
++      /*
++       * The io_uring_enter() manpage suggests that the appropriate
++       * reaction to EAGAIN is:
++       *
++       * "The application should wait for some completions and try
++       * again"
++       *
++       * However, it seems unlikely that that would help in our case, as
++       * we apply a low limit to the number of outstanding IOs and thus
++       * also outstanding completions, making it unlikely that we'd get
++       * EAGAIN while the OS is in good working order.
++       *
++       * Additionally, it would be problematic to just wait here, our
++       * caller might hold critical locks. It'd possibly lead to
++       * delaying the crash-restart that seems likely to occur when the
++       * kernel is under such heavy memory pressure.
++       *
++       * Update errno to allow %m to work.
++       */
++      errno = -ret;
++      elog(PANIC, "io_uring submit failed: %m");
++    }
++    // else if (ret != num_staged_ios) // this fails with SQPOLL enabled
++    else if (ret < num_staged_ios)
++    {
++      /* likely unreachable, but if it is, we would need to re-submit */
++      elog(PANIC, "io_uring submit submitted only %d of %d", ret,
++           num_staged_ios);
++    }
++    else
++    {
++      pgaio_debug(DEBUG4, "aio method uring: submitted %d IOs", num_staged_ios);
++      break;
++    }
++  }
++
++  return num_staged_ios;
+ }
+ 
+-static void
+-pgaio_uring_completion_error_callback(void *arg)
++static void pgaio_uring_completion_error_callback(void *arg)
+ {
+-	ProcNumber	owner;
+-	PGPROC	   *owner_proc;
+-	int32		owner_pid;
+-	PgAioHandle *ioh = arg;
++  ProcNumber owner;
++  PGPROC *owner_proc;
++  int32 owner_pid;
++  PgAioHandle *ioh = arg;
+ 
+-	if (!ioh)
+-		return;
++  if (!ioh)
++    return;
+ 
+-	/* No need for context if a backend is completing the IO for itself */
+-	if (ioh->owner_procno == MyProcNumber)
+-		return;
++  /* No need for context if a backend is completing the IO for itself */
++  if (ioh->owner_procno == MyProcNumber)
++    return;
+ 
+-	owner = ioh->owner_procno;
+-	owner_proc = GetPGProcByNumber(owner);
+-	owner_pid = owner_proc->pid;
++  owner = ioh->owner_procno;
++  owner_proc = GetPGProcByNumber(owner);
++  owner_pid = owner_proc->pid;
+ 
+-	errcontext("completing I/O on behalf of process %d", owner_pid);
++  errcontext("completing I/O on behalf of process %d", owner_pid);
+ }
+ 
+-static void
+-pgaio_uring_drain_locked(PgAioUringContext *context)
++static void pgaio_uring_drain_locked(PgAioUringContext *context)
+ {
+-	int			ready;
+-	int			orig_ready;
+-	ErrorContextCallback errcallback = {0};
+-
+-	Assert(LWLockHeldByMeInMode(&context->completion_lock, LW_EXCLUSIVE));
+-
+-	errcallback.callback = pgaio_uring_completion_error_callback;
+-	errcallback.previous = error_context_stack;
+-	error_context_stack = &errcallback;
+-
+-	/*
+-	 * Don't drain more events than available right now. Otherwise it's
+-	 * plausible that one backend could get stuck, for a while, receiving CQEs
+-	 * without actually processing them.
+-	 */
+-	orig_ready = ready = io_uring_cq_ready(&context->io_uring_ring);
+-
+-	while (ready > 0)
+-	{
+-		struct io_uring_cqe *cqes[PGAIO_MAX_LOCAL_COMPLETED_IO];
+-		uint32		ncqes;
+-
+-		START_CRIT_SECTION();
+-		ncqes =
+-			io_uring_peek_batch_cqe(&context->io_uring_ring,
+-									cqes,
+-									Min(PGAIO_MAX_LOCAL_COMPLETED_IO, ready));
+-		Assert(ncqes <= ready);
+-
+-		ready -= ncqes;
+-
+-		for (int i = 0; i < ncqes; i++)
+-		{
+-			struct io_uring_cqe *cqe = cqes[i];
+-			PgAioHandle *ioh;
+-
+-			ioh = io_uring_cqe_get_data(cqe);
+-			errcallback.arg = ioh;
+-			io_uring_cqe_seen(&context->io_uring_ring, cqe);
+-
+-			pgaio_io_process_completion(ioh, cqe->res);
+-			errcallback.arg = NULL;
+-		}
+-
+-		END_CRIT_SECTION();
+-
+-		pgaio_debug(DEBUG3,
+-					"drained %d/%d, now expecting %d",
+-					ncqes, orig_ready, io_uring_cq_ready(&context->io_uring_ring));
+-	}
+-
+-	error_context_stack = errcallback.previous;
++  int ready;
++  int orig_ready;
++  ErrorContextCallback errcallback = {0};
++
++  Assert(LWLockHeldByMeInMode(&context->completion_lock, LW_EXCLUSIVE));
++
++  errcallback.callback = pgaio_uring_completion_error_callback;
++  errcallback.previous = error_context_stack;
++  error_context_stack = &errcallback;
++
++  /*
++   * Don't drain more events than available right now. Otherwise it's
++   * plausible that one backend could get stuck, for a while, receiving CQEs
++   * without actually processing them.
++   */
++  orig_ready = ready = io_uring_cq_ready(&context->io_uring_ring);
++
++  while (ready > 0)
++  {
++    struct io_uring_cqe *cqes[PGAIO_MAX_LOCAL_COMPLETED_IO];
++    uint32 ncqes;
++
++    START_CRIT_SECTION();
++    ncqes = io_uring_peek_batch_cqe(&context->io_uring_ring, cqes,
++                                    Min(PGAIO_MAX_LOCAL_COMPLETED_IO, ready));
++    Assert(ncqes <= ready);
++
++    ready -= ncqes;
++
++    for (int i = 0; i < ncqes; i++)
++    {
++      struct io_uring_cqe *cqe = cqes[i];
++      PgAioHandle *ioh;
++
++      ioh = io_uring_cqe_get_data(cqe);
++      errcallback.arg = ioh;
++      io_uring_cqe_seen(&context->io_uring_ring, cqe);
++
++      pgaio_io_process_completion(ioh, cqe->res);
++      errcallback.arg = NULL;
++    }
++
++    END_CRIT_SECTION();
++
++    pgaio_debug(DEBUG3, "drained %d/%d, now expecting %d", ncqes, orig_ready,
++                io_uring_cq_ready(&context->io_uring_ring));
++  }
++
++  error_context_stack = errcallback.previous;
+ }
+ 
+-static void
+-pgaio_uring_wait_one(PgAioHandle *ioh, uint64 ref_generation)
++static void pgaio_uring_wait_one(PgAioHandle *ioh, uint64 ref_generation)
+ {
+-	PgAioHandleState state;
+-	ProcNumber	owner_procno = ioh->owner_procno;
+-	PgAioUringContext *owner_context = &pgaio_uring_contexts[owner_procno];
+-	bool		expect_cqe;
+-	int			waited = 0;
+-
+-	/*
+-	 * XXX: It would be nice to have a smarter locking scheme, nearly all the
+-	 * time the backend owning the ring will consume the completions, making
+-	 * the locking unnecessarily expensive.
+-	 */
+-	LWLockAcquire(&owner_context->completion_lock, LW_EXCLUSIVE);
+-
+-	while (true)
+-	{
+-		pgaio_debug_io(DEBUG3, ioh,
+-					   "wait_one io_gen: %" PRIu64 ", ref_gen: %" PRIu64 ", cycle %d",
+-					   ioh->generation,
+-					   ref_generation,
+-					   waited);
+-
+-		if (pgaio_io_was_recycled(ioh, ref_generation, &state) ||
+-			state != PGAIO_HS_SUBMITTED)
+-		{
+-			/* the IO was completed by another backend */
+-			break;
+-		}
+-		else if (io_uring_cq_ready(&owner_context->io_uring_ring))
+-		{
+-			/* no need to wait in the kernel, io_uring has a completion */
+-			expect_cqe = true;
+-		}
+-		else
+-		{
+-			int			ret;
+-			struct io_uring_cqe *cqes;
+-
+-			/* need to wait in the kernel */
+-			pgstat_report_wait_start(WAIT_EVENT_AIO_IO_URING_EXECUTION);
+-			ret = io_uring_wait_cqes(&owner_context->io_uring_ring, &cqes, 1, NULL, NULL);
+-			pgstat_report_wait_end();
+-
+-			if (ret == -EINTR)
+-			{
+-				continue;
+-			}
+-			else if (ret != 0)
+-			{
+-				/* see comment after io_uring_submit() */
+-				errno = -ret;
+-				elog(PANIC, "io_uring wait failed: %m");
+-			}
+-			else
+-			{
+-				Assert(cqes != NULL);
+-				expect_cqe = true;
+-				waited++;
+-			}
+-		}
+-
+-		if (expect_cqe)
+-		{
+-			pgaio_uring_drain_locked(owner_context);
+-		}
+-	}
+-
+-	LWLockRelease(&owner_context->completion_lock);
+-
+-	pgaio_debug(DEBUG3,
+-				"wait_one with %d sleeps",
+-				waited);
++  PgAioHandleState state;
++  ProcNumber owner_procno = ioh->owner_procno;
++  PgAioUringContext *owner_context = &pgaio_uring_contexts[owner_procno];
++  bool expect_cqe;
++  int waited = 0;
++
++  /*
++   * XXX: It would be nice to have a smarter locking scheme, nearly all the
++   * time the backend owning the ring will consume the completions, making
++   * the locking unnecessarily expensive.
++   */
++  LWLockAcquire(&owner_context->completion_lock, LW_EXCLUSIVE);
++
++  while (true)
++  {
++    pgaio_debug_io(DEBUG3, ioh,
++                   "wait_one io_gen: %" PRIu64 ", ref_gen: %" PRIu64
++                   ", cycle %d",
++                   ioh->generation, ref_generation, waited);
++
++    if (pgaio_io_was_recycled(ioh, ref_generation, &state) ||
++        state != PGAIO_HS_SUBMITTED)
++    {
++      /* the IO was completed by another backend */
++      break;
++    }
++    else if (io_uring_cq_ready(&owner_context->io_uring_ring))
++    {
++      /* no need to wait in the kernel, io_uring has a completion */
++      expect_cqe = true;
++    }
++    else
++    {
++      int ret;
++      struct io_uring_cqe *cqes;
++
++      /* need to wait in the kernel */
++      pgstat_report_wait_start(WAIT_EVENT_AIO_IO_URING_EXECUTION);
++      ret = io_uring_wait_cqes(&owner_context->io_uring_ring, &cqes, 1, NULL,
++                               NULL);
++      pgstat_report_wait_end();
++
++      if (ret == -EINTR)
++      {
++        continue;
++      }
++      else if (ret != 0)
++      {
++        /* see comment after io_uring_submit() */
++        errno = -ret;
++        elog(PANIC, "io_uring wait failed: %m");
++      }
++      else
++      {
++        Assert(cqes != NULL);
++        expect_cqe = true;
++        waited++;
++      }
++    }
++
++    if (expect_cqe)
++    {
++      pgaio_uring_drain_locked(owner_context);
++    }
++  }
++
++  LWLockRelease(&owner_context->completion_lock);
++
++  pgaio_debug(DEBUG3, "wait_one with %d sleeps", waited);
+ }
+ 
+-static void
+-pgaio_uring_sq_from_io(PgAioHandle *ioh, struct io_uring_sqe *sqe)
++static void pgaio_uring_sq_from_io(PgAioHandle *ioh, struct io_uring_sqe *sqe)
+ {
+-	struct iovec *iov;
+-
+-	switch (ioh->op)
+-	{
+-		case PGAIO_OP_READV:
+-			iov = &pgaio_ctl->iovecs[ioh->iovec_off];
+-			if (ioh->op_data.read.iov_length == 1)
+-			{
+-				io_uring_prep_read(sqe,
+-								   ioh->op_data.read.fd,
+-								   iov->iov_base,
+-								   iov->iov_len,
+-								   ioh->op_data.read.offset);
+-			}
+-			else
+-			{
+-				io_uring_prep_readv(sqe,
+-									ioh->op_data.read.fd,
+-									iov,
+-									ioh->op_data.read.iov_length,
+-									ioh->op_data.read.offset);
+-
+-			}
+-			break;
+-
+-		case PGAIO_OP_WRITEV:
+-			iov = &pgaio_ctl->iovecs[ioh->iovec_off];
+-			if (ioh->op_data.write.iov_length == 1)
+-			{
+-				io_uring_prep_write(sqe,
+-									ioh->op_data.write.fd,
+-									iov->iov_base,
+-									iov->iov_len,
+-									ioh->op_data.write.offset);
+-			}
+-			else
+-			{
+-				io_uring_prep_writev(sqe,
+-									 ioh->op_data.write.fd,
+-									 iov,
+-									 ioh->op_data.write.iov_length,
+-									 ioh->op_data.write.offset);
+-			}
+-			break;
+-
+-		case PGAIO_OP_INVALID:
+-			elog(ERROR, "trying to prepare invalid IO operation for execution");
+-	}
+-
+-	io_uring_sqe_set_data(sqe, ioh);
++  struct iovec *iov;
++
++  switch (ioh->op)
++  {
++  case PGAIO_OP_READV:
++    iov = &pgaio_ctl->iovecs[ioh->iovec_off];
++
++#if LOG_READS
++    for (int i = 0; i < ioh->op_data.read.iov_length; ++i)
++    {
++      ereport(LOG, (errmsg("read [%d] base: %p len: %d fd: %d", i, iov[i].iov_base, iov[i].iov_len, ioh->op_data.read.fd)));
++    }
++#endif
++
++    int fd = ioh->op_data.read.fd;
++
++    if (ioh->op_data.read.iov_length == 1)
++    {
++#if !FIXED_BUFS
++      io_uring_prep_read(sqe, ioh->op_data.read.fd, iov->iov_base, iov->iov_len,
++                         ioh->op_data.read.offset);
++#else
++
++      io_uring_prep_read_fixed(sqe, ioh->op_data.read.fd, iov->iov_base, iov->iov_len,
++                               ioh->op_data.read.offset, 0);
++#endif
++      // ereport(LOG, (errmsg("read %d", iov->iov_len)));
++    }
++    else
++    {
++#if !FIXED_BUFS
++      io_uring_prep_readv(sqe, ioh->op_data.read.fd, iov,
++                          ioh->op_data.read.iov_length,
++                          ioh->op_data.read.offset);
++#else
++      io_uring_prep_readv_fixed(sqe, ioh->op_data.read.fd, iov,
++                                ioh->op_data.read.iov_length,
++                                ioh->op_data.read.offset, 0, 0);
++#endif
++
++      // ereport(LOG, (errmsg("readv %d", ioh->op_data.read.iov_length)));
++    }
++
++#if FIXED_FDS
++    int fixed_fd = fd_to_idx[fd];
++    if (fixed_fd == -1)
++    {
++      ereport(LOG, (errmsg("something wrong, no fixed_fd for %d", fd)));
++    }
++    else
++    {
++      sqe->fd = fixed_fd;
++      sqe->flags |= IOSQE_FIXED_FILE;
++    }
++#endif
++
++    break;
++
++  case PGAIO_OP_WRITEV:
++    iov = &pgaio_ctl->iovecs[ioh->iovec_off];
++    if (ioh->op_data.write.iov_length == 1)
++    {
++      io_uring_prep_write(sqe, ioh->op_data.write.fd, iov->iov_base,
++                          iov->iov_len, ioh->op_data.write.offset);
++      // ereport(LOG, (errmsg("write %d", iov->iov_len)));
++    }
++    else
++    {
++      io_uring_prep_writev(sqe, ioh->op_data.write.fd, iov,
++                           ioh->op_data.write.iov_length,
++                           ioh->op_data.write.offset);
++      // ereport(LOG, (errmsg("writev %d", ioh->op_data.read.iov_length)));
++    }
++    break;
++
++  case PGAIO_OP_INVALID:
++    elog(ERROR, "trying to prepare invalid IO operation for execution");
++  }
++
++  io_uring_sqe_set_data(sqe, ioh);
+ }
+ 
+-#endif							/* IOMETHOD_IO_URING_ENABLED */
++#endif /* IOMETHOD_IO_URING_ENABLED */
+diff --git a/src/backend/storage/buffer/buf_init.c b/src/backend/storage/buffer/buf_init.c
+index ed1dc488a42..412e8f1cfd3 100644
+--- a/src/backend/storage/buffer/buf_init.c
++++ b/src/backend/storage/buffer/buf_init.c
+@@ -19,12 +19,11 @@
+ #include "storage/bufmgr.h"
+ 
+ BufferDescPadded *BufferDescriptors;
+-char	   *BufferBlocks;
++char *BufferBlocks;
+ ConditionVariableMinimallyPadded *BufferIOCVArray;
+ WritebackContext BackendWritebackContext;
+ CkptSortItem *CkptBufferIds;
+ 
+-
+ /*
+  * Data Structures:
+  *		buffers live in a freelist and a lookup data structure.
+@@ -57,20 +56,18 @@ CkptSortItem *CkptBufferIds;
+  *		multiple times. Check the PrivateRefCount infrastructure in bufmgr.c.
+  */
+ 
+-
+ /*
+  * Initialize shared buffer pool
+  *
+  * This is called once during shared-memory initialization (either in the
+  * postmaster, or in a standalone backend).
+  */
+-void
+-BufferManagerShmemInit(void)
++void BufferManagerShmemInit(void)
+ {
+-	bool		foundBufs,
+-				foundDescs,
+-				foundIOCV,
+-				foundBufCkpt;
++	bool foundBufs,
++		foundDescs,
++		foundIOCV,
++		foundBufCkpt;
+ 
+ 	/* Align descriptors to a cacheline boundary. */
+ 	BufferDescriptors = (BufferDescPadded *)
+@@ -82,7 +79,7 @@ BufferManagerShmemInit(void)
+ 	BufferBlocks = (char *)
+ 		TYPEALIGN(PG_IO_ALIGN_SIZE,
+ 				  ShmemInitStruct("Buffer Blocks",
+-								  NBuffers * (Size) BLCKSZ + PG_IO_ALIGN_SIZE,
++								  NBuffers * (Size)BLCKSZ + PG_IO_ALIGN_SIZE,
+ 								  &foundBufs));
+ 
+ 	/* Align condition variables to cacheline boundary. */
+@@ -110,11 +107,12 @@ BufferManagerShmemInit(void)
+ 	}
+ 	else
+ 	{
+-		int			i;
++		int i;
+ 
+ 		/*
+ 		 * Initialize all the buffer headers.
+ 		 */
++		ereport(LOG, (errmsg("NBuffers %d start: %p", NBuffers, (void *)BufferBlocks)));
+ 		for (i = 0; i < NBuffers; i++)
+ 		{
+ 			BufferDesc *buf = GetBufferDescriptor(i);
+@@ -158,10 +156,9 @@ BufferManagerShmemInit(void)
+  * compute the size of shared memory for the buffer pool including
+  * data pages, buffer descriptors, hash tables, etc.
+  */
+-Size
+-BufferManagerShmemSize(void)
++Size BufferManagerShmemSize(void)
+ {
+-	Size		size = 0;
++	Size size = 0;
+ 
+ 	/* size of buffer descriptors */
+ 	size = add_size(size, mul_size(NBuffers, sizeof(BufferDescPadded)));
+diff --git a/src/backend/storage/file/fd.c b/src/backend/storage/file/fd.c
+index a4ec7959f31..fdb59d48853 100644
+--- a/src/backend/storage/file/fd.c
++++ b/src/backend/storage/file/fd.c
+@@ -75,7 +75,7 @@
+ #include <dirent.h>
+ #include <sys/file.h>
+ #include <sys/param.h>
+-#include <sys/resource.h>		/* for getrlimit */
++#include <sys/resource.h> /* for getrlimit */
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #ifndef WIN32
+@@ -126,7 +126,7 @@
+  * the number of open files.  (This appears to be true on most if not
+  * all platforms as of Feb 2004.)
+  */
+-#define NUM_RESERVED_FDS		10
++#define NUM_RESERVED_FDS 10
+ 
+ /*
+  * If we have fewer than this many usable FDs after allowing for the reserved
+@@ -135,7 +135,7 @@
+  * at least 16; as of this writing, the contrib/postgres_fdw regression tests
+  * will not pass unless that can grow to at least 14.)
+  */
+-#define FD_MINFREE				48
++#define FD_MINFREE 48
+ 
+ /*
+  * A number of platforms allow individual processes to open many more files
+@@ -143,7 +143,7 @@
+  * This GUC parameter lets the DBA limit max_safe_fds to something less than
+  * what the postmaster's initial probe suggests will work.
+  */
+-int			max_files_per_process = 1000;
++int max_files_per_process = 1000;
+ 
+ /*
+  * Maximum number of file descriptors to open for operations that fd.c knows
+@@ -156,56 +156,57 @@ int			max_files_per_process = 1000;
+  * Note: the value of max_files_per_process is taken into account while
+  * setting this variable, and so need not be tested separately.
+  */
+-int			max_safe_fds = FD_MINFREE;	/* default if not changed */
++int max_safe_fds = FD_MINFREE; /* default if not changed */
+ 
+ /* Whether it is safe to continue running after fsync() fails. */
+-bool		data_sync_retry = false;
++bool data_sync_retry = false;
+ 
+ /* How SyncDataDirectory() should do its job. */
+-int			recovery_init_sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
++int recovery_init_sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
+ 
+ /* Which kinds of files should be opened with PG_O_DIRECT. */
+-int			io_direct_flags;
++int io_direct_flags;
+ 
+ /* Debugging.... */
+ 
+ #ifdef FDDEBUG
+-#define DO_DB(A) \
+-	do { \
+-		int			_do_db_save_errno = errno; \
+-		A; \
+-		errno = _do_db_save_errno; \
++#define DO_DB(A)                       \
++	do                                 \
++	{                                  \
++		int _do_db_save_errno = errno; \
++		A;                             \
++		errno = _do_db_save_errno;     \
+ 	} while (0)
+ #else
+ #define DO_DB(A) \
+-	((void) 0)
++	((void)0)
+ #endif
+ 
+ #define VFD_CLOSED (-1)
+ 
+ #define FileIsValid(file) \
+-	((file) > 0 && (file) < (int) SizeVfdCache && VfdCache[file].fileName != NULL)
++	((file) > 0 && (file) < (int)SizeVfdCache && VfdCache[file].fileName != NULL)
+ 
+ #define FileIsNotOpen(file) (VfdCache[file].fd == VFD_CLOSED)
+ 
+ /* these are the assigned bits in fdstate below: */
+-#define FD_DELETE_AT_CLOSE	(1 << 0)	/* T = delete when closed */
+-#define FD_CLOSE_AT_EOXACT	(1 << 1)	/* T = close at eoXact */
+-#define FD_TEMP_FILE_LIMIT	(1 << 2)	/* T = respect temp_file_limit */
++#define FD_DELETE_AT_CLOSE (1 << 0) /* T = delete when closed */
++#define FD_CLOSE_AT_EOXACT (1 << 1) /* T = close at eoXact */
++#define FD_TEMP_FILE_LIMIT (1 << 2) /* T = respect temp_file_limit */
+ 
+ typedef struct vfd
+ {
+-	int			fd;				/* current FD, or VFD_CLOSED if none */
+-	unsigned short fdstate;		/* bitflags for VFD's state */
+-	ResourceOwner resowner;		/* owner, for automatic cleanup */
+-	File		nextFree;		/* link to next free VFD, if in freelist */
+-	File		lruMoreRecently;	/* doubly linked recency-of-use list */
+-	File		lruLessRecently;
+-	off_t		fileSize;		/* current size of file (0 if not temporary) */
+-	char	   *fileName;		/* name of file, or NULL for unused VFD */
++	int fd;					/* current FD, or VFD_CLOSED if none */
++	unsigned short fdstate; /* bitflags for VFD's state */
++	ResourceOwner resowner; /* owner, for automatic cleanup */
++	File nextFree;			/* link to next free VFD, if in freelist */
++	File lruMoreRecently;	/* doubly linked recency-of-use list */
++	File lruLessRecently;
++	off_t fileSize; /* current size of file (0 if not temporary) */
++	char *fileName; /* name of file, or NULL for unused VFD */
+ 	/* NB: fileName is malloc'd, and must be free'd when closing the VFD */
+-	int			fileFlags;		/* open(2) flags for (re)opening the file */
+-	mode_t		fileMode;		/* mode to pass to open(2) */
++	int fileFlags;	 /* open(2) flags for (re)opening the file */
++	mode_t fileMode; /* mode to pass to open(2) */
+ } Vfd;
+ 
+ /*
+@@ -219,7 +220,7 @@ static Size SizeVfdCache = 0;
+ /*
+  * Number of file descriptors known to be in use by VFD entries.
+  */
+-static int	nfile = 0;
++static int nfile = 0;
+ 
+ /*
+  * Flag to tell whether it's worth scanning VfdCache looking for temp files
+@@ -258,20 +259,20 @@ typedef struct
+ 	SubTransactionId create_subid;
+ 	union
+ 	{
+-		FILE	   *file;
+-		DIR		   *dir;
+-		int			fd;
+-	}			desc;
++		FILE *file;
++		DIR *dir;
++		int fd;
++	} desc;
+ } AllocateDesc;
+ 
+-static int	numAllocatedDescs = 0;
+-static int	maxAllocatedDescs = 0;
++static int numAllocatedDescs = 0;
++static int maxAllocatedDescs = 0;
+ static AllocateDesc *allocatedDescs = NULL;
+ 
+ /*
+  * Number of open "external" FDs reported to Reserve/ReleaseExternalFD.
+  */
+-static int	numExternalFDs = 0;
++static int numExternalFDs = 0;
+ 
+ /*
+  * Number of temporary files opened during the current session;
+@@ -286,9 +287,8 @@ static long tempFileCounter = 0;
+  * transaction.
+  */
+ static Oid *tempTableSpaces = NULL;
+-static int	numTempTableSpaces = -1;
+-static int	nextTempTableSpace = 0;
+-
++static int numTempTableSpaces = -1;
++static int nextTempTableSpace = 0;
+ 
+ /*--------------------
+  *
+@@ -325,16 +325,16 @@ static int	nextTempTableSpace = 0;
+ static void Delete(File file);
+ static void LruDelete(File file);
+ static void Insert(File file);
+-static int	LruInsert(File file);
++static int LruInsert(File file);
+ static bool ReleaseLruFile(void);
+ static void ReleaseLruFiles(void);
+ static File AllocateVfd(void);
+ static void FreeVfd(File file);
+ 
+-static int	FileAccess(File file);
++static int FileAccess(File file);
+ static File OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError);
+ static bool reserveAllocatedDesc(void);
+-static int	FreeDesc(AllocateDesc *desc);
++static int FreeDesc(AllocateDesc *desc);
+ 
+ static void BeforeShmemExit_Files(int code, Datum arg);
+ static void CleanupTempFiles(bool isCommit, bool isProcExit);
+@@ -342,7 +342,7 @@ static void RemovePgTempRelationFiles(const char *tsdirname);
+ static void RemovePgTempRelationFilesInDbspace(const char *dbspacedirname);
+ 
+ static void walkdir(const char *path,
+-					void (*action) (const char *fname, bool isdir, int elevel),
++					void (*action)(const char *fname, bool isdir, int elevel),
+ 					bool process_symlinks,
+ 					int elevel);
+ #ifdef PG_FLUSH_DATA_WORKS
+@@ -351,21 +351,19 @@ static void pre_sync_fname(const char *fname, bool isdir, int elevel);
+ static void datadir_fsync_fname(const char *fname, bool isdir, int elevel);
+ static void unlink_if_exists_fname(const char *fname, bool isdir, int elevel);
+ 
+-static int	fsync_parent_path(const char *fname, int elevel);
+-
++static int fsync_parent_path(const char *fname, int elevel);
+ 
+ /* ResourceOwner callbacks to hold virtual file descriptors */
+ static void ResOwnerReleaseFile(Datum res);
+ static char *ResOwnerPrintFile(Datum res);
+ 
+ static const ResourceOwnerDesc file_resowner_desc =
+-{
+-	.name = "File",
+-	.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
+-	.release_priority = RELEASE_PRIO_FILES,
+-	.ReleaseResource = ResOwnerReleaseFile,
+-	.DebugPrint = ResOwnerPrintFile
+-};
++	{
++		.name = "File",
++		.release_phase = RESOURCE_RELEASE_AFTER_LOCKS,
++		.release_priority = RELEASE_PRIO_FILES,
++		.ReleaseResource = ResOwnerReleaseFile,
++		.DebugPrint = ResOwnerPrintFile};
+ 
+ /* Convenience wrappers over ResourceOwnerRemember/Forget */
+ static inline void
+@@ -382,8 +380,7 @@ ResourceOwnerForgetFile(ResourceOwner owner, File file)
+ /*
+  * pg_fsync --- do fsync with or without writethrough
+  */
+-int
+-pg_fsync(int fd)
++int pg_fsync(int fd)
+ {
+ #if !defined(WIN32) && defined(USE_ASSERT_CHECKING)
+ 	struct stat st;
+@@ -408,7 +405,7 @@ pg_fsync(int fd)
+ 	 */
+ 	if (fstat(fd, &st) == 0)
+ 	{
+-		int			desc_flags = fcntl(fd, F_GETFL);
++		int desc_flags = fcntl(fd, F_GETFL);
+ 
+ 		desc_flags &= O_ACCMODE;
+ 
+@@ -429,15 +426,13 @@ pg_fsync(int fd)
+ 		return pg_fsync_no_writethrough(fd);
+ }
+ 
+-
+ /*
+  * pg_fsync_no_writethrough --- same as fsync except does nothing if
+  *	enableFsync is off
+  */
+-int
+-pg_fsync_no_writethrough(int fd)
++int pg_fsync_no_writethrough(int fd)
+ {
+-	int			rc;
++	int rc;
+ 
+ 	if (!enableFsync)
+ 		return 0;
+@@ -454,8 +449,7 @@ retry:
+ /*
+  * pg_fsync_writethrough
+  */
+-int
+-pg_fsync_writethrough(int fd)
++int pg_fsync_writethrough(int fd)
+ {
+ 	if (enableFsync)
+ 	{
+@@ -473,10 +467,9 @@ pg_fsync_writethrough(int fd)
+ /*
+  * pg_fdatasync --- same as fdatasync except does nothing if enableFsync is off
+  */
+-int
+-pg_fdatasync(int fd)
++int pg_fdatasync(int fd)
+ {
+-	int			rc;
++	int rc;
+ 
+ 	if (!enableFsync)
+ 		return 0;
+@@ -496,8 +489,7 @@ retry:
+  * This requires an absolute path to the file.  Returns true if the file is
+  * not a directory, false otherwise.
+  */
+-bool
+-pg_file_exists(const char *name)
++bool pg_file_exists(const char *name)
+ {
+ 	struct stat st;
+ 
+@@ -518,8 +510,7 @@ pg_file_exists(const char *name)
+  *
+  * offset of 0 with nbytes 0 means that the entire file should be flushed
+  */
+-void
+-pg_flush_data(int fd, off_t offset, off_t nbytes)
++void pg_flush_data(int fd, off_t offset, off_t nbytes)
+ {
+ 	/*
+ 	 * Right now file flushing is primarily used to avoid making later
+@@ -536,13 +527,13 @@ pg_flush_data(int fd, off_t offset, off_t nbytes)
+ 	 */
+ #if defined(HAVE_SYNC_FILE_RANGE)
+ 	{
+-		int			rc;
++		int rc;
+ 		static bool not_implemented_by_kernel = false;
+ 
+ 		if (not_implemented_by_kernel)
+ 			return;
+ 
+-retry:
++	retry:
+ 
+ 		/*
+ 		 * sync_file_range(SYNC_FILE_RANGE_WRITE), currently linux specific,
+@@ -557,7 +548,7 @@ retry:
+ 							 SYNC_FILE_RANGE_WRITE);
+ 		if (rc != 0)
+ 		{
+-			int			elevel;
++			int elevel;
+ 
+ 			if (rc == EINTR)
+ 				goto retry;
+@@ -585,8 +576,8 @@ retry:
+ #endif
+ #if !defined(WIN32) && defined(MS_ASYNC)
+ 	{
+-		void	   *p;
+-		static int	pagesize = 0;
++		void *p;
++		static int pagesize = 0;
+ 
+ 		/*
+ 		 * On several OSs msync(MS_ASYNC) on a mmap'ed file triggers
+@@ -635,16 +626,16 @@ retry:
+ 		 * may simply not be enough address space.  If so, silently fall
+ 		 * through to the next implementation.
+ 		 */
+-		if (nbytes <= (off_t) SSIZE_MAX)
++		if (nbytes <= (off_t)SSIZE_MAX)
+ 			p = mmap(NULL, nbytes, PROT_READ, MAP_SHARED, fd, offset);
+ 		else
+ 			p = MAP_FAILED;
+ 
+ 		if (p != MAP_FAILED)
+ 		{
+-			int			rc;
++			int rc;
+ 
+-			rc = msync(p, (size_t) nbytes, MS_ASYNC);
++			rc = msync(p, (size_t)nbytes, MS_ASYNC);
+ 			if (rc != 0)
+ 			{
+ 				ereport(data_sync_elevel(WARNING),
+@@ -653,7 +644,7 @@ retry:
+ 				/* NB: need to fall through to munmap()! */
+ 			}
+ 
+-			rc = munmap(p, (size_t) nbytes);
++			rc = munmap(p, (size_t)nbytes);
+ 			if (rc != 0)
+ 			{
+ 				/* FATAL error because mapping would remain */
+@@ -668,7 +659,7 @@ retry:
+ #endif
+ #if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_DONTNEED)
+ 	{
+-		int			rc;
++		int rc;
+ 
+ 		/*
+ 		 * Signal the kernel that the passed in range should not be cached
+@@ -699,7 +690,7 @@ retry:
+ static int
+ pg_ftruncate(int fd, off_t length)
+ {
+-	int			ret;
++	int ret;
+ 
+ retry:
+ 	ret = ftruncate(fd, length);
+@@ -713,13 +704,12 @@ retry:
+ /*
+  * Truncate a file to a given length by name.
+  */
+-int
+-pg_truncate(const char *path, off_t length)
++int pg_truncate(const char *path, off_t length)
+ {
+-	int			ret;
++	int ret;
+ #ifdef WIN32
+-	int			save_errno;
+-	int			fd;
++	int save_errno;
++	int fd;
+ 
+ 	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
+ 	if (fd >= 0)
+@@ -749,8 +739,7 @@ retry:
+  * Try to fsync a file or directory. When doing the latter, ignore errors that
+  * indicate the OS just doesn't allow/require fsyncing directories.
+  */
+-void
+-fsync_fname(const char *fname, bool isdir)
++void fsync_fname(const char *fname, bool isdir)
+ {
+ 	fsync_fname_ext(fname, isdir, false, data_sync_elevel(ERROR));
+ }
+@@ -775,10 +764,9 @@ fsync_fname(const char *fname, bool isdir)
+  * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
+  * valid upon return.
+  */
+-int
+-durable_rename(const char *oldfile, const char *newfile, int elevel)
++int durable_rename(const char *oldfile, const char *newfile, int elevel)
+ {
+-	int			fd;
++	int fd;
+ 
+ 	/*
+ 	 * First fsync the old and target path (if it exists), to ensure that they
+@@ -805,7 +793,7 @@ durable_rename(const char *oldfile, const char *newfile, int elevel)
+ 	{
+ 		if (pg_fsync(fd) != 0)
+ 		{
+-			int			save_errno;
++			int save_errno;
+ 
+ 			/* close file upon error, might not be in transaction context */
+ 			save_errno = errno;
+@@ -865,8 +853,7 @@ durable_rename(const char *oldfile, const char *newfile, int elevel)
+  * Returns 0 if the operation succeeded, -1 otherwise. Note that errno is not
+  * valid upon return.
+  */
+-int
+-durable_unlink(const char *fname, int elevel)
++int durable_unlink(const char *fname, int elevel)
+ {
+ 	if (unlink(fname) < 0)
+ 	{
+@@ -896,13 +883,12 @@ durable_unlink(const char *fname, int elevel)
+  * Note that this does not initialize temporary file access, that is
+  * separately initialized via InitTemporaryFileAccess().
+  */
+-void
+-InitFileAccess(void)
++void InitFileAccess(void)
+ {
+-	Assert(SizeVfdCache == 0);	/* call me only once */
++	Assert(SizeVfdCache == 0); /* call me only once */
+ 
+ 	/* initialize cache header entry */
+-	VfdCache = (Vfd *) malloc(sizeof(Vfd));
++	VfdCache = (Vfd *)malloc(sizeof(Vfd));
+ 	if (VfdCache == NULL)
+ 		ereport(FATAL,
+ 				(errcode(ERRCODE_OUT_OF_MEMORY),
+@@ -926,11 +912,10 @@ InitFileAccess(void)
+  * available for longer, hence the separate initialization / shutdown of
+  * temporary file handling.
+  */
+-void
+-InitTemporaryFileAccess(void)
++void InitTemporaryFileAccess(void)
+ {
+-	Assert(SizeVfdCache != 0);	/* InitFileAccess() needs to have run */
+-	Assert(!temporary_files_allowed);	/* call me only once */
++	Assert(SizeVfdCache != 0);		  /* InitFileAccess() needs to have run */
++	Assert(!temporary_files_allowed); /* call me only once */
+ 
+ 	/*
+ 	 * Register before-shmem-exit hook to ensure temp files are dropped while
+@@ -960,30 +945,30 @@ InitTemporaryFileAccess(void)
+ static void
+ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
+ {
+-	int		   *fd;
+-	int			size;
+-	int			used = 0;
+-	int			highestfd = 0;
+-	int			j;
++	int *fd;
++	int size;
++	int used = 0;
++	int highestfd = 0;
++	int j;
+ 
+ #ifdef HAVE_GETRLIMIT
+ 	struct rlimit rlim;
+-	int			getrlimit_status;
++	int getrlimit_status;
+ #endif
+ 
+ 	size = 1024;
+-	fd = (int *) palloc(size * sizeof(int));
++	fd = (int *)palloc(size * sizeof(int));
+ 
+ #ifdef HAVE_GETRLIMIT
+ 	getrlimit_status = getrlimit(RLIMIT_NOFILE, &rlim);
+ 	if (getrlimit_status != 0)
+ 		ereport(WARNING, (errmsg("getrlimit failed: %m")));
+-#endif							/* HAVE_GETRLIMIT */
++#endif /* HAVE_GETRLIMIT */
+ 
+ 	/* dup until failure or probe limit reached */
+ 	for (;;)
+ 	{
+-		int			thisfd;
++		int thisfd;
+ 
+ #ifdef HAVE_GETRLIMIT
+ 
+@@ -1007,7 +992,7 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
+ 		if (used >= size)
+ 		{
+ 			size *= 2;
+-			fd = (int *) repalloc(fd, size * sizeof(int));
++			fd = (int *)repalloc(fd, size * sizeof(int));
+ 		}
+ 		fd[used++] = thisfd;
+ 
+@@ -1037,11 +1022,10 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
+  * set_max_safe_fds
+  *		Determine number of file descriptors that fd.c is allowed to use
+  */
+-void
+-set_max_safe_fds(void)
++void set_max_safe_fds(void)
+ {
+-	int			usable_fds;
+-	int			already_open;
++	int usable_fds;
++	int already_open;
+ 
+ 	/*----------
+ 	 * We want to set max_safe_fds to
+@@ -1082,8 +1066,7 @@ set_max_safe_fds(void)
+  * Open a file with BasicOpenFilePerm() and pass default file mode for the
+  * fileMode parameter.
+  */
+-int
+-BasicOpenFile(const char *fileName, int fileFlags)
++int BasicOpenFile(const char *fileName, int fileFlags)
+ {
+ 	return BasicOpenFilePerm(fileName, fileFlags, pg_file_create_mode);
+ }
+@@ -1104,10 +1087,17 @@ BasicOpenFile(const char *fileName, int fileFlags)
+  * direct open() calls done early in backend startup.  Those are OK since
+  * this module wouldn't have any open files to close at that point anyway.
+  */
+-int
+-BasicOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
++#include "../uring_config.h"
++
++#if FIXED_FDS
++extern const char *file_paths[];
++extern const int num_files;
++extern int fd_to_idx[300];
++#endif
++
++int BasicOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ {
+-	int			fd;
++	int fd;
+ 
+ tryAgain:
+ #ifdef PG_O_DIRECT_USE_F_NOCACHE
+@@ -1133,6 +1123,22 @@ tryAgain:
+ 	fd = open(fileName, fileFlags, fileMode);
+ #endif
+ 
++#if LOG_OPENS
++	ereport(LOG, (errmsg("open %d -> %s flags: %d", fd, fileName, fileFlags)));
++#endif
++
++#if FIXED_FDS
++	for (int i = 0; i < num_files; ++i)
++	{
++		if (strcmp(file_paths[i], fileName) == 0)
++		{
++			// ereport(LOG, (errmsg("found at index %d, existing value: %d", i, fd_to_idx[fd])));
++			fd_to_idx[fd] = i;
++			break;
++		}
++	}
++#endif
++
+ 	if (fd >= 0)
+ 	{
+ #ifdef PG_O_DIRECT_USE_F_NOCACHE
+@@ -1140,7 +1146,7 @@ tryAgain:
+ 		{
+ 			if (fcntl(fd, F_NOCACHE, 1) < 0)
+ 			{
+-				int			save_errno = errno;
++				int save_errno = errno;
+ 
+ 				close(fd);
+ 				errno = save_errno;
+@@ -1149,12 +1155,12 @@ tryAgain:
+ 		}
+ #endif
+ 
+-		return fd;				/* success! */
++		return fd; /* success! */
+ 	}
+ 
+ 	if (errno == EMFILE || errno == ENFILE)
+ 	{
+-		int			save_errno = errno;
++		int save_errno = errno;
+ 
+ 		ereport(LOG,
+ 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+@@ -1165,7 +1171,7 @@ tryAgain:
+ 		errno = save_errno;
+ 	}
+ 
+-	return -1;					/* failure */
++	return -1; /* failure */
+ }
+ 
+ /*
+@@ -1181,8 +1187,7 @@ tryAgain:
+  * any code where the total number of FDs to be reserved is not predictable
+  * and small.
+  */
+-bool
+-AcquireExternalFD(void)
++bool AcquireExternalFD(void)
+ {
+ 	/*
+ 	 * We don't want more than max_safe_fds / 3 FDs to be consumed for
+@@ -1216,8 +1221,7 @@ AcquireExternalFD(void)
+  * an EMFILE failure if not everybody played nice.  In any case, it's solely
+  * caller's responsibility to keep the external-FD count in sync with reality.
+  */
+-void
+-ReserveExternalFD(void)
++void ReserveExternalFD(void)
+ {
+ 	/*
+ 	 * Release VFDs if needed to stay safe.  Because we do this before
+@@ -1234,22 +1238,20 @@ ReserveExternalFD(void)
+  *
+  * This is guaranteed not to change errno, so it can be used in failure paths.
+  */
+-void
+-ReleaseExternalFD(void)
++void ReleaseExternalFD(void)
+ {
+ 	Assert(numExternalFDs > 0);
+ 	numExternalFDs--;
+ }
+ 
+-
+ #if defined(FDDEBUG)
+ 
+ static void
+ _dump_lru(void)
+ {
+-	int			mru = VfdCache[0].lruLessRecently;
+-	Vfd		   *vfdP = &VfdCache[mru];
+-	char		buf[2048];
++	int mru = VfdCache[0].lruLessRecently;
++	Vfd *vfdP = &VfdCache[mru];
++	char buf[2048];
+ 
+ 	snprintf(buf, sizeof(buf), "LRU: MOST %d ", mru);
+ 	while (mru != 0)
+@@ -1261,12 +1263,12 @@ _dump_lru(void)
+ 	snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "LEAST");
+ 	elog(LOG, "%s", buf);
+ }
+-#endif							/* FDDEBUG */
++#endif /* FDDEBUG */
+ 
+ static void
+ Delete(File file)
+ {
+-	Vfd		   *vfdP;
++	Vfd *vfdP;
+ 
+ 	Assert(file != 0);
+ 
+@@ -1285,7 +1287,7 @@ Delete(File file)
+ static void
+ LruDelete(File file)
+ {
+-	Vfd		   *vfdP;
++	Vfd *vfdP;
+ 
+ 	Assert(file != 0);
+ 
+@@ -1313,7 +1315,7 @@ LruDelete(File file)
+ static void
+ Insert(File file)
+ {
+-	Vfd		   *vfdP;
++	Vfd *vfdP;
+ 
+ 	Assert(file != 0);
+ 
+@@ -1335,7 +1337,7 @@ Insert(File file)
+ static int
+ LruInsert(File file)
+ {
+-	Vfd		   *vfdP;
++	Vfd *vfdP;
+ 
+ 	Assert(file != 0);
+ 
+@@ -1392,9 +1394,9 @@ ReleaseLruFile(void)
+ 		 */
+ 		Assert(VfdCache[0].lruMoreRecently != 0);
+ 		LruDelete(VfdCache[0].lruMoreRecently);
+-		return true;			/* freed a file */
++		return true; /* freed a file */
+ 	}
+-	return false;				/* no files available to free */
++	return false; /* no files available to free */
+ }
+ 
+ /*
+@@ -1414,12 +1416,12 @@ ReleaseLruFiles(void)
+ static File
+ AllocateVfd(void)
+ {
+-	Index		i;
+-	File		file;
++	Index i;
++	File file;
+ 
+ 	DO_DB(elog(LOG, "AllocateVfd. Size %zu", SizeVfdCache));
+ 
+-	Assert(SizeVfdCache > 0);	/* InitFileAccess not called? */
++	Assert(SizeVfdCache > 0); /* InitFileAccess not called? */
+ 
+ 	if (VfdCache[0].nextFree == 0)
+ 	{
+@@ -1428,8 +1430,8 @@ AllocateVfd(void)
+ 		 * array.  We choose to double it each time this happens. However,
+ 		 * there's not much point in starting *real* small.
+ 		 */
+-		Size		newCacheSize = SizeVfdCache * 2;
+-		Vfd		   *newVfdCache;
++		Size newCacheSize = SizeVfdCache * 2;
++		Vfd *newVfdCache;
+ 
+ 		if (newCacheSize < 32)
+ 			newCacheSize = 32;
+@@ -1437,7 +1439,7 @@ AllocateVfd(void)
+ 		/*
+ 		 * Be careful not to clobber VfdCache ptr if realloc fails.
+ 		 */
+-		newVfdCache = (Vfd *) realloc(VfdCache, sizeof(Vfd) * newCacheSize);
++		newVfdCache = (Vfd *)realloc(VfdCache, sizeof(Vfd) * newCacheSize);
+ 		if (newVfdCache == NULL)
+ 			ereport(ERROR,
+ 					(errcode(ERRCODE_OUT_OF_MEMORY),
+@@ -1472,7 +1474,7 @@ AllocateVfd(void)
+ static void
+ FreeVfd(File file)
+ {
+-	Vfd		   *vfdP = &VfdCache[file];
++	Vfd *vfdP = &VfdCache[file];
+ 
+ 	DO_DB(elog(LOG, "FreeVfd: %d (%s)",
+ 			   file, vfdP->fileName ? vfdP->fileName : ""));
+@@ -1492,7 +1494,7 @@ FreeVfd(File file)
+ static int
+ FileAccess(File file)
+ {
+-	int			returnValue;
++	int returnValue;
+ 
+ 	DO_DB(elog(LOG, "FileAccess %d (%s)",
+ 			   file, VfdCache[file].fileName));
+@@ -1535,7 +1537,7 @@ ReportTemporaryFileUsage(const char *path, off_t size)
+ 		if ((size / 1024) >= log_temp_files)
+ 			ereport(LOG,
+ 					(errmsg("temporary file: path \"%s\", size %lu",
+-							path, (unsigned long) size)));
++							path, (unsigned long)size)));
+ 	}
+ }
+ 
+@@ -1559,8 +1561,7 @@ RegisterTemporaryFile(File file)
+  *	Called when we get a shared invalidation message on some relation.
+  */
+ #ifdef NOT_USED
+-void
+-FileInvalidate(File file)
++void FileInvalidate(File file)
+ {
+ 	Assert(FileIsValid(file));
+ 	if (!FileIsNotOpen(file))
+@@ -1572,8 +1573,7 @@ FileInvalidate(File file)
+  * Open a file with PathNameOpenFilePerm() and pass default file mode for the
+  * fileMode parameter.
+  */
+-File
+-PathNameOpenFile(const char *fileName, int fileFlags)
++File PathNameOpenFile(const char *fileName, int fileFlags)
+ {
+ 	return PathNameOpenFilePerm(fileName, fileFlags, pg_file_create_mode);
+ }
+@@ -1585,12 +1585,11 @@ PathNameOpenFile(const char *fileName, int fileFlags)
+  * it will be interpreted relative to the process' working directory
+  * (which should always be $PGDATA when this code is running).
+  */
+-File
+-PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
++File PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ {
+-	char	   *fnamecopy;
+-	File		file;
+-	Vfd		   *vfdP;
++	char *fnamecopy;
++	File file;
++	Vfd *vfdP;
+ 
+ 	DO_DB(elog(LOG, "PathNameOpenFilePerm: %s %x %o",
+ 			   fileName, fileFlags, fileMode));
+@@ -1622,7 +1621,7 @@ PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ 
+ 	if (vfdP->fd < 0)
+ 	{
+-		int			save_errno = errno;
++		int save_errno = errno;
+ 
+ 		FreeVfd(file);
+ 		free(fnamecopy);
+@@ -1656,9 +1655,8 @@ PathNameOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+  * with PG_TEMP_FILE_PREFIX, so that they can be identified as temporary and
+  * deleted at startup by RemovePgTempFiles().  Further subdirectories below
+  * that do not need any particular prefix.
+-*/
+-void
+-PathNameCreateTemporaryDir(const char *basedir, const char *directory)
++ */
++void PathNameCreateTemporaryDir(const char *basedir, const char *directory)
+ {
+ 	if (MakePGDirectory(directory) < 0)
+ 	{
+@@ -1688,8 +1686,7 @@ PathNameCreateTemporaryDir(const char *basedir, const char *directory)
+ /*
+  * Delete a directory and everything in it, if it exists.
+  */
+-void
+-PathNameDeleteTemporaryDir(const char *dirname)
++void PathNameDeleteTemporaryDir(const char *dirname)
+ {
+ 	struct stat statbuf;
+ 
+@@ -1721,12 +1718,11 @@ PathNameDeleteTemporaryDir(const char *dirname)
+  * if you need "somewhat" temporary storage, this might be useful. In either
+  * case, the file is removed when the File is explicitly closed.
+  */
+-File
+-OpenTemporaryFile(bool interXact)
++File OpenTemporaryFile(bool interXact)
+ {
+-	File		file = 0;
++	File file = 0;
+ 
+-	Assert(temporary_files_allowed);	/* check temp file access is up */
++	Assert(temporary_files_allowed); /* check temp file access is up */
+ 
+ 	/*
+ 	 * Make sure the current resource owner has space for this File before we
+@@ -1746,7 +1742,7 @@ OpenTemporaryFile(bool interXact)
+ 	 */
+ 	if (numTempTableSpaces > 0 && !interXact)
+ 	{
+-		Oid			tblspcOid = GetNextTempTableSpace();
++		Oid tblspcOid = GetNextTempTableSpace();
+ 
+ 		if (OidIsValid(tblspcOid))
+ 			file = OpenTemporaryFileInTablespace(tblspcOid, false);
+@@ -1758,9 +1754,7 @@ OpenTemporaryFile(bool interXact)
+ 	 * here, but just in case it isn't, fall back to pg_default tablespace.
+ 	 */
+ 	if (file <= 0)
+-		file = OpenTemporaryFileInTablespace(MyDatabaseTableSpace ?
+-											 MyDatabaseTableSpace :
+-											 DEFAULTTABLESPACE_OID,
++		file = OpenTemporaryFileInTablespace(MyDatabaseTableSpace ? MyDatabaseTableSpace : DEFAULTTABLESPACE_OID,
+ 											 true);
+ 
+ 	/* Mark it for deletion at close and temporary file size limit */
+@@ -1776,8 +1770,7 @@ OpenTemporaryFile(bool interXact)
+ /*
+  * Return the path of the temp directory in a given tablespace.
+  */
+-void
+-TempTablespacePath(char *path, Oid tablespace)
++void TempTablespacePath(char *path, Oid tablespace)
+ {
+ 	/*
+ 	 * Identify the tempfile directory for this tablespace.
+@@ -1804,9 +1797,9 @@ TempTablespacePath(char *path, Oid tablespace)
+ static File
+ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+ {
+-	char		tempdirpath[MAXPGPATH];
+-	char		tempfilepath[MAXPGPATH];
+-	File		file;
++	char tempdirpath[MAXPGPATH];
++	char tempfilepath[MAXPGPATH];
++	File file;
+ 
+ 	TempTablespacePath(tempdirpath, tblspcOid);
+ 
+@@ -1833,7 +1826,7 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+ 		 * someone else just did the same thing.  If it doesn't work then
+ 		 * we'll bomb out on the second create attempt, instead.
+ 		 */
+-		(void) MakePGDirectory(tempdirpath);
++		(void)MakePGDirectory(tempdirpath);
+ 
+ 		file = PathNameOpenFile(tempfilepath,
+ 								O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
+@@ -1845,7 +1838,6 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+ 	return file;
+ }
+ 
+-
+ /*
+  * Create a new file.  The directory containing it must already exist.  Files
+  * created this way are subject to temp_file_limit and are automatically
+@@ -1858,12 +1850,11 @@ OpenTemporaryFileInTablespace(Oid tblspcOid, bool rejectError)
+  * inside a directory created with PathNameCreateTemporaryDir(), in which case
+  * the prefix isn't needed.
+  */
+-File
+-PathNameCreateTemporaryFile(const char *path, bool error_on_failure)
++File PathNameCreateTemporaryFile(const char *path, bool error_on_failure)
+ {
+-	File		file;
++	File file;
+ 
+-	Assert(temporary_files_allowed);	/* check temp file access is up */
++	Assert(temporary_files_allowed); /* check temp file access is up */
+ 
+ 	ResourceOwnerEnlarge(CurrentResourceOwner);
+ 
+@@ -1898,12 +1889,11 @@ PathNameCreateTemporaryFile(const char *path, bool error_on_failure)
+  * temp_file_limit of the caller, are automatically closed at the end of the
+  * transaction but are not deleted on close.
+  */
+-File
+-PathNameOpenTemporaryFile(const char *path, int mode)
++File PathNameOpenTemporaryFile(const char *path, int mode)
+ {
+-	File		file;
++	File file;
+ 
+-	Assert(temporary_files_allowed);	/* check temp file access is up */
++	Assert(temporary_files_allowed); /* check temp file access is up */
+ 
+ 	ResourceOwnerEnlarge(CurrentResourceOwner);
+ 
+@@ -1929,11 +1919,10 @@ PathNameOpenTemporaryFile(const char *path, int mode)
+  * Delete a file by pathname.  Return true if the file existed, false if
+  * didn't.
+  */
+-bool
+-PathNameDeleteTemporaryFile(const char *path, bool error_on_failure)
++bool PathNameDeleteTemporaryFile(const char *path, bool error_on_failure)
+ {
+ 	struct stat filestats;
+-	int			stat_errno;
++	int stat_errno;
+ 
+ 	/* Get the final size for pgstat reporting. */
+ 	if (stat(path, &filestats) != 0)
+@@ -1975,10 +1964,9 @@ PathNameDeleteTemporaryFile(const char *path, bool error_on_failure)
+ /*
+  * close a file when done with it
+  */
+-void
+-FileClose(File file)
++void FileClose(File file)
+ {
+-	Vfd		   *vfdP;
++	Vfd *vfdP;
+ 
+ 	Assert(FileIsValid(file));
+ 
+@@ -2022,7 +2010,7 @@ FileClose(File file)
+ 	if (vfdP->fdstate & FD_DELETE_AT_CLOSE)
+ 	{
+ 		struct stat filestats;
+-		int			stat_errno;
++		int stat_errno;
+ 
+ 		/*
+ 		 * If we get an error, as could happen within the ereport/elog calls,
+@@ -2033,7 +2021,6 @@ FileClose(File file)
+ 		 */
+ 		vfdP->fdstate &= ~FD_DELETE_AT_CLOSE;
+ 
+-
+ 		/* first try the stat() */
+ 		if (stat(vfdP->fileName, &filestats))
+ 			stat_errno = errno;
+@@ -2076,24 +2063,23 @@ FileClose(File file)
+  * posix_fadvise() is the simplest standardized interface that accomplishes
+  * this.
+  */
+-int
+-FilePrefetch(File file, off_t offset, off_t amount, uint32 wait_event_info)
++int FilePrefetch(File file, off_t offset, off_t amount, uint32 wait_event_info)
+ {
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FilePrefetch: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset, (int64) amount));
++			   (int64)offset, (int64)amount));
+ 
+ #if defined(USE_POSIX_FADVISE) && defined(POSIX_FADV_WILLNEED)
+ 	{
+-		int			returnCode;
++		int returnCode;
+ 
+ 		returnCode = FileAccess(file);
+ 		if (returnCode < 0)
+ 			return returnCode;
+ 
+-retry:
++	retry:
+ 		pgstat_report_wait_start(wait_event_info);
+ 		returnCode = posix_fadvise(VfdCache[file].fd, offset, amount,
+ 								   POSIX_FADV_WILLNEED);
+@@ -2108,10 +2094,10 @@ retry:
+ 	{
+ 		struct radvisory
+ 		{
+-			off_t		ra_offset;	/* offset into the file */
+-			int			ra_count;	/* size of the read     */
+-		}			ra;
+-		int			returnCode;
++			off_t ra_offset; /* offset into the file */
++			int ra_count;	 /* size of the read     */
++		} ra;
++		int returnCode;
+ 
+ 		returnCode = FileAccess(file);
+ 		if (returnCode < 0)
+@@ -2132,16 +2118,15 @@ retry:
+ #endif
+ }
+ 
+-void
+-FileWriteback(File file, off_t offset, off_t nbytes, uint32 wait_event_info)
++void FileWriteback(File file, off_t offset, off_t nbytes, uint32 wait_event_info)
+ {
+-	int			returnCode;
++	int returnCode;
+ 
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FileWriteback: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset, (int64) nbytes));
++			   (int64)offset, (int64)nbytes));
+ 
+ 	if (nbytes <= 0)
+ 		return;
+@@ -2162,14 +2147,14 @@ ssize_t
+ FileReadV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+ 		  uint32 wait_event_info)
+ {
+-	ssize_t		returnCode;
+-	Vfd		   *vfdP;
++	ssize_t returnCode;
++	Vfd *vfdP;
+ 
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FileReadV: %d (%s) " INT64_FORMAT " %d",
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset,
++			   (int64)offset,
+ 			   iovcnt));
+ 
+ 	returnCode = FileAccess(file);
+@@ -2193,17 +2178,17 @@ retry:
+ 		 * in which case immediate retry is indicated.
+ 		 */
+ #ifdef WIN32
+-		DWORD		error = GetLastError();
++		DWORD error = GetLastError();
+ 
+ 		switch (error)
+ 		{
+-			case ERROR_NO_SYSTEM_RESOURCES:
+-				pg_usleep(1000L);
+-				errno = EINTR;
+-				break;
+-			default:
+-				_dosmaperr(error);
+-				break;
++		case ERROR_NO_SYSTEM_RESOURCES:
++			pg_usleep(1000L);
++			errno = EINTR;
++			break;
++		default:
++			_dosmaperr(error);
++			break;
+ 		}
+ #endif
+ 		/* OK to retry if interrupted */
+@@ -2214,19 +2199,18 @@ retry:
+ 	return returnCode;
+ }
+ 
+-int
+-FileStartReadV(PgAioHandle *ioh, File file,
+-			   int iovcnt, off_t offset,
+-			   uint32 wait_event_info)
++int FileStartReadV(PgAioHandle *ioh, File file,
++				   int iovcnt, off_t offset,
++				   uint32 wait_event_info)
+ {
+-	int			returnCode;
+-	Vfd		   *vfdP;
++	int returnCode;
++	Vfd *vfdP;
+ 
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FileStartReadV: %d (%s) " INT64_FORMAT " %d",
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset,
++			   (int64)offset,
+ 			   iovcnt));
+ 
+ 	returnCode = FileAccess(file);
+@@ -2244,14 +2228,14 @@ ssize_t
+ FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+ 		   uint32 wait_event_info)
+ {
+-	ssize_t		returnCode;
+-	Vfd		   *vfdP;
++	ssize_t returnCode;
++	Vfd *vfdP;
+ 
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FileWriteV: %d (%s) " INT64_FORMAT " %d",
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset,
++			   (int64)offset,
+ 			   iovcnt));
+ 
+ 	returnCode = FileAccess(file);
+@@ -2270,17 +2254,17 @@ FileWriteV(File file, const struct iovec *iov, int iovcnt, off_t offset,
+ 	 */
+ 	if (temp_file_limit >= 0 && (vfdP->fdstate & FD_TEMP_FILE_LIMIT))
+ 	{
+-		off_t		past_write = offset;
++		off_t past_write = offset;
+ 
+ 		for (int i = 0; i < iovcnt; ++i)
+ 			past_write += iov[i].iov_len;
+ 
+ 		if (past_write > vfdP->fileSize)
+ 		{
+-			uint64		newTotal = temporary_files_size;
++			uint64 newTotal = temporary_files_size;
+ 
+ 			newTotal += past_write - vfdP->fileSize;
+-			if (newTotal > (uint64) temp_file_limit * (uint64) 1024)
++			if (newTotal > (uint64)temp_file_limit * (uint64)1024)
+ 				ereport(ERROR,
+ 						(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+ 						 errmsg("temporary file size exceeds \"temp_file_limit\" (%dkB)",
+@@ -2309,7 +2293,7 @@ retry:
+ 		 */
+ 		if (vfdP->fdstate & FD_TEMP_FILE_LIMIT)
+ 		{
+-			off_t		past_write = offset + returnCode;
++			off_t past_write = offset + returnCode;
+ 
+ 			if (past_write > vfdP->fileSize)
+ 			{
+@@ -2324,17 +2308,17 @@ retry:
+ 		 * See comments in FileReadV()
+ 		 */
+ #ifdef WIN32
+-		DWORD		error = GetLastError();
++		DWORD error = GetLastError();
+ 
+ 		switch (error)
+ 		{
+-			case ERROR_NO_SYSTEM_RESOURCES:
+-				pg_usleep(1000L);
+-				errno = EINTR;
+-				break;
+-			default:
+-				_dosmaperr(error);
+-				break;
++		case ERROR_NO_SYSTEM_RESOURCES:
++			pg_usleep(1000L);
++			errno = EINTR;
++			break;
++		default:
++			_dosmaperr(error);
++			break;
+ 		}
+ #endif
+ 		/* OK to retry if interrupted */
+@@ -2345,10 +2329,9 @@ retry:
+ 	return returnCode;
+ }
+ 
+-int
+-FileSync(File file, uint32 wait_event_info)
++int FileSync(File file, uint32 wait_event_info)
+ {
+-	int			returnCode;
++	int returnCode;
+ 
+ 	Assert(FileIsValid(file));
+ 
+@@ -2372,17 +2355,16 @@ FileSync(File file, uint32 wait_event_info)
+  * Returns 0 on success, -1 otherwise. In the latter case errno is set to the
+  * appropriate error.
+  */
+-int
+-FileZero(File file, off_t offset, off_t amount, uint32 wait_event_info)
++int FileZero(File file, off_t offset, off_t amount, uint32 wait_event_info)
+ {
+-	int			returnCode;
+-	ssize_t		written;
++	int returnCode;
++	ssize_t written;
+ 
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FileZero: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset, (int64) amount));
++			   (int64)offset, (int64)amount));
+ 
+ 	returnCode = FileAccess(file);
+ 	if (returnCode < 0)
+@@ -2417,17 +2399,16 @@ FileZero(File file, off_t offset, off_t amount, uint32 wait_event_info)
+  * Returns 0 on success, -1 otherwise. In the latter case errno is set to the
+  * appropriate error.
+  */
+-int
+-FileFallocate(File file, off_t offset, off_t amount, uint32 wait_event_info)
++int FileFallocate(File file, off_t offset, off_t amount, uint32 wait_event_info)
+ {
+ #ifdef HAVE_POSIX_FALLOCATE
+-	int			returnCode;
++	int returnCode;
+ 
+ 	Assert(FileIsValid(file));
+ 
+ 	DO_DB(elog(LOG, "FileFallocate: %d (%s) " INT64_FORMAT " " INT64_FORMAT,
+ 			   file, VfdCache[file].fileName,
+-			   (int64) offset, (int64) amount));
++			   (int64)offset, (int64)amount));
+ 
+ 	returnCode = FileAccess(file);
+ 	if (returnCode < 0)
+@@ -2457,8 +2438,7 @@ retry:
+ 	return FileZero(file, offset, amount, wait_event_info);
+ }
+ 
+-off_t
+-FileSize(File file)
++off_t FileSize(File file)
+ {
+ 	Assert(FileIsValid(file));
+ 
+@@ -2468,16 +2448,15 @@ FileSize(File file)
+ 	if (FileIsNotOpen(file))
+ 	{
+ 		if (FileAccess(file) < 0)
+-			return (off_t) -1;
++			return (off_t)-1;
+ 	}
+ 
+ 	return lseek(VfdCache[file].fd, 0, SEEK_END);
+ }
+ 
+-int
+-FileTruncate(File file, off_t offset, uint32 wait_event_info)
++int FileTruncate(File file, off_t offset, uint32 wait_event_info)
+ {
+-	int			returnCode;
++	int returnCode;
+ 
+ 	Assert(FileIsValid(file));
+ 
+@@ -2525,10 +2504,9 @@ FilePathName(File file)
+  * be careful not to do much of anything else before it finishes using the
+  * returned file descriptor.
+  */
+-int
+-FileGetRawDesc(File file)
++int FileGetRawDesc(File file)
+ {
+-	int			returnCode;
++	int returnCode;
+ 
+ 	returnCode = FileAccess(file);
+ 	if (returnCode < 0)
+@@ -2541,8 +2519,7 @@ FileGetRawDesc(File file)
+ /*
+  * FileGetRawFlags - returns the file flags on open(2)
+  */
+-int
+-FileGetRawFlags(File file)
++int FileGetRawFlags(File file)
+ {
+ 	Assert(FileIsValid(file));
+ 	return VfdCache[file].fileFlags;
+@@ -2566,7 +2543,7 @@ static bool
+ reserveAllocatedDesc(void)
+ {
+ 	AllocateDesc *newDescs;
+-	int			newMax;
++	int newMax;
+ 
+ 	/* Quick out if array already has a free slot. */
+ 	if (numAllocatedDescs < maxAllocatedDescs)
+@@ -2581,7 +2558,7 @@ reserveAllocatedDesc(void)
+ 	if (allocatedDescs == NULL)
+ 	{
+ 		newMax = FD_MINFREE / 3;
+-		newDescs = (AllocateDesc *) malloc(newMax * sizeof(AllocateDesc));
++		newDescs = (AllocateDesc *)malloc(newMax * sizeof(AllocateDesc));
+ 		/* Out of memory already?  Treat as fatal error. */
+ 		if (newDescs == NULL)
+ 			ereport(ERROR,
+@@ -2606,8 +2583,8 @@ reserveAllocatedDesc(void)
+ 	newMax = max_safe_fds / 3;
+ 	if (newMax > maxAllocatedDescs)
+ 	{
+-		newDescs = (AllocateDesc *) realloc(allocatedDescs,
+-											newMax * sizeof(AllocateDesc));
++		newDescs = (AllocateDesc *)realloc(allocatedDescs,
++										   newMax * sizeof(AllocateDesc));
+ 		/* Treat out-of-memory as a non-fatal error. */
+ 		if (newDescs == NULL)
+ 			return false;
+@@ -2640,7 +2617,7 @@ reserveAllocatedDesc(void)
+ FILE *
+ AllocateFile(const char *name, const char *mode)
+ {
+-	FILE	   *file;
++	FILE *file;
+ 
+ 	DO_DB(elog(LOG, "AllocateFile: Allocated %d (%s)",
+ 			   numAllocatedDescs, name));
+@@ -2669,7 +2646,7 @@ TryAgain:
+ 
+ 	if (errno == EMFILE || errno == ENFILE)
+ 	{
+-		int			save_errno = errno;
++		int save_errno = errno;
+ 
+ 		ereport(LOG,
+ 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+@@ -2687,8 +2664,7 @@ TryAgain:
+  * Open a file with OpenTransientFilePerm() and pass default file mode for
+  * the fileMode parameter.
+  */
+-int
+-OpenTransientFile(const char *fileName, int fileFlags)
++int OpenTransientFile(const char *fileName, int fileFlags)
+ {
+ 	return OpenTransientFilePerm(fileName, fileFlags, pg_file_create_mode);
+ }
+@@ -2696,10 +2672,9 @@ OpenTransientFile(const char *fileName, int fileFlags)
+ /*
+  * Like AllocateFile, but returns an unbuffered fd like open(2)
+  */
+-int
+-OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
++int OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ {
+-	int			fd;
++	int fd;
+ 
+ 	DO_DB(elog(LOG, "OpenTransientFile: Allocated %d (%s)",
+ 			   numAllocatedDescs, fileName));
+@@ -2728,7 +2703,7 @@ OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ 		return fd;
+ 	}
+ 
+-	return -1;					/* failure */
++	return -1; /* failure */
+ }
+ 
+ /*
+@@ -2743,8 +2718,8 @@ OpenTransientFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
+ FILE *
+ OpenPipeStream(const char *command, const char *mode)
+ {
+-	FILE	   *file;
+-	int			save_errno;
++	FILE *file;
++	int save_errno;
+ 
+ 	DO_DB(elog(LOG, "OpenPipeStream: Allocated %d (%s)",
+ 			   numAllocatedDescs, command));
+@@ -2799,28 +2774,28 @@ TryAgain:
+ static int
+ FreeDesc(AllocateDesc *desc)
+ {
+-	int			result;
++	int result;
+ 
+ 	/* Close the underlying object */
+ 	switch (desc->kind)
+ 	{
+-		case AllocateDescFile:
+-			result = fclose(desc->desc.file);
+-			break;
+-		case AllocateDescPipe:
+-			result = pclose(desc->desc.file);
+-			break;
+-		case AllocateDescDir:
+-			result = closedir(desc->desc.dir);
+-			break;
+-		case AllocateDescRawFD:
+-			pgaio_closing_fd(desc->desc.fd);
+-			result = close(desc->desc.fd);
+-			break;
+-		default:
+-			elog(ERROR, "AllocateDesc kind not recognized");
+-			result = 0;			/* keep compiler quiet */
+-			break;
++	case AllocateDescFile:
++		result = fclose(desc->desc.file);
++		break;
++	case AllocateDescPipe:
++		result = pclose(desc->desc.file);
++		break;
++	case AllocateDescDir:
++		result = closedir(desc->desc.dir);
++		break;
++	case AllocateDescRawFD:
++		pgaio_closing_fd(desc->desc.fd);
++		result = close(desc->desc.fd);
++		break;
++	default:
++		elog(ERROR, "AllocateDesc kind not recognized");
++		result = 0; /* keep compiler quiet */
++		break;
+ 	}
+ 
+ 	/* Compact storage in the allocatedDescs array */
+@@ -2836,10 +2811,9 @@ FreeDesc(AllocateDesc *desc)
+  * Note we do not check fclose's return value --- it is up to the caller
+  * to handle close errors.
+  */
+-int
+-FreeFile(FILE *file)
++int FreeFile(FILE *file)
+ {
+-	int			i;
++	int i;
+ 
+ 	DO_DB(elog(LOG, "FreeFile: Allocated %d", numAllocatedDescs));
+ 
+@@ -2864,10 +2838,9 @@ FreeFile(FILE *file)
+  * Note we do not check close's return value --- it is up to the caller
+  * to handle close errors.
+  */
+-int
+-CloseTransientFile(int fd)
++int CloseTransientFile(int fd)
+ {
+-	int			i;
++	int i;
+ 
+ 	DO_DB(elog(LOG, "CloseTransientFile: Allocated %d", numAllocatedDescs));
+ 
+@@ -2900,10 +2873,9 @@ CloseTransientFile(int fd)
+  *
+  * Ideally this should be the *only* direct call of opendir() in the backend.
+  */
+-DIR *
+-AllocateDir(const char *dirname)
++DIR *AllocateDir(const char *dirname)
+ {
+-	DIR		   *dir;
++	DIR *dir;
+ 
+ 	DO_DB(elog(LOG, "AllocateDir: Allocated %d (%s)",
+ 			   numAllocatedDescs, dirname));
+@@ -2932,7 +2904,7 @@ TryAgain:
+ 
+ 	if (errno == EMFILE || errno == ENFILE)
+ 	{
+-		int			save_errno = errno;
++		int save_errno = errno;
+ 
+ 		ereport(LOG,
+ 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+@@ -3018,10 +2990,9 @@ ReadDirExtended(DIR *dir, const char *dirname, int elevel)
+  * Does nothing if dir == NULL; we assume that directory open failure was
+  * already reported if desired.
+  */
+-int
+-FreeDir(DIR *dir)
++int FreeDir(DIR *dir)
+ {
+-	int			i;
++	int i;
+ 
+ 	/* Nothing to do if AllocateDir failed */
+ 	if (dir == NULL)
+@@ -3044,14 +3015,12 @@ FreeDir(DIR *dir)
+ 	return closedir(dir);
+ }
+ 
+-
+ /*
+  * Close a pipe stream returned by OpenPipeStream.
+  */
+-int
+-ClosePipeStream(FILE *file)
++int ClosePipeStream(FILE *file)
+ {
+-	int			i;
++	int i;
+ 
+ 	DO_DB(elog(LOG, "ClosePipeStream: Allocated %d", numAllocatedDescs));
+ 
+@@ -3077,14 +3046,13 @@ ClosePipeStream(FILE *file)
+  * possible number of kernel file descriptors are in use.  There is no
+  * change in the logical state of the VFDs.
+  */
+-void
+-closeAllVfds(void)
++void closeAllVfds(void)
+ {
+-	Index		i;
++	Index i;
+ 
+ 	if (SizeVfdCache > 0)
+ 	{
+-		Assert(FileIsNotOpen(0));	/* Make sure ring not corrupted */
++		Assert(FileIsNotOpen(0)); /* Make sure ring not corrupted */
+ 		for (i = 1; i < SizeVfdCache; i++)
+ 		{
+ 			if (!FileIsNotOpen(i))
+@@ -3093,7 +3061,6 @@ closeAllVfds(void)
+ 	}
+ }
+ 
+-
+ /*
+  * SetTempTablespaces
+  *
+@@ -3106,8 +3073,7 @@ closeAllVfds(void)
+  * Some entries of the array may be InvalidOid, indicating that the current
+  * database's default tablespace should be used.
+  */
+-void
+-SetTempTablespaces(Oid *tableSpaces, int numSpaces)
++void SetTempTablespaces(Oid *tableSpaces, int numSpaces)
+ {
+ 	Assert(numSpaces >= 0);
+ 	tempTableSpaces = tableSpaces;
+@@ -3135,8 +3101,7 @@ SetTempTablespaces(Oid *tableSpaces, int numSpaces)
+  * (This is just so that tablespaces.c doesn't need its own per-transaction
+  * state.)
+  */
+-bool
+-TempTablespacesAreSet(void)
++bool TempTablespacesAreSet(void)
+ {
+ 	return (numTempTableSpaces >= 0);
+ }
+@@ -3150,10 +3115,9 @@ TempTablespacesAreSet(void)
+  * entries will be filled.
+  * Returns the number of OIDs that were copied into the output array.
+  */
+-int
+-GetTempTablespaces(Oid *tableSpaces, int numSpaces)
++int GetTempTablespaces(Oid *tableSpaces, int numSpaces)
+ {
+-	int			i;
++	int i;
+ 
+ 	Assert(TempTablespacesAreSet());
+ 	for (i = 0; i < numTempTableSpaces && i < numSpaces; ++i)
+@@ -3168,8 +3132,7 @@ GetTempTablespaces(Oid *tableSpaces, int numSpaces)
+  * Select the next temp tablespace to use.  A result of InvalidOid means
+  * to use the current database's default tablespace.
+  */
+-Oid
+-GetNextTempTableSpace(void)
++Oid GetNextTempTableSpace(void)
+ {
+ 	if (numTempTableSpaces > 0)
+ 	{
+@@ -3181,7 +3144,6 @@ GetNextTempTableSpace(void)
+ 	return InvalidOid;
+ }
+ 
+-
+ /*
+  * AtEOSubXact_Files
+  *
+@@ -3189,11 +3151,10 @@ GetNextTempTableSpace(void)
+  * that the subtransaction may have opened.  At commit, we reassign the
+  * files that were opened to the parent subtransaction.
+  */
+-void
+-AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
+-				  SubTransactionId parentSubid)
++void AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
++					   SubTransactionId parentSubid)
+ {
+-	Index		i;
++	Index i;
+ 
+ 	for (i = 0; i < numAllocatedDescs; i++)
+ 	{
+@@ -3222,8 +3183,7 @@ AtEOSubXact_Files(bool isCommit, SubTransactionId mySubid,
+  * The isCommit flag is used only to decide whether to emit warnings about
+  * unclosed files.
+  */
+-void
+-AtEOXact_Files(bool isCommit)
++void AtEOXact_Files(bool isCommit)
+ {
+ 	CleanupTempFiles(isCommit, false);
+ 	tempTableSpaces = NULL;
+@@ -3262,7 +3222,7 @@ BeforeShmemExit_Files(int code, Datum arg)
+ static void
+ CleanupTempFiles(bool isCommit, bool isProcExit)
+ {
+-	Index		i;
++	Index i;
+ 
+ 	/*
+ 	 * Careful here: at proc_exit we need extra cleanup, not just
+@@ -3270,7 +3230,7 @@ CleanupTempFiles(bool isCommit, bool isProcExit)
+ 	 */
+ 	if (isProcExit || have_xact_temporary_files)
+ 	{
+-		Assert(FileIsNotOpen(0));	/* Make sure ring not corrupted */
++		Assert(FileIsNotOpen(0)); /* Make sure ring not corrupted */
+ 		for (i = 1; i < SizeVfdCache; i++)
+ 		{
+ 			unsigned short fdstate = VfdCache[i].fdstate;
+@@ -3310,7 +3270,6 @@ CleanupTempFiles(bool isCommit, bool isProcExit)
+ 		FreeDesc(&allocatedDescs[0]);
+ }
+ 
+-
+ /*
+  * Remove temporary and temporary relation files left over from a prior
+  * postmaster session
+@@ -3331,11 +3290,10 @@ CleanupTempFiles(bool isCommit, bool isProcExit)
+  * with ereport(LOG) and keep going.  Removing temp files is not so critical
+  * that we should fail to start the database when we can't do it.
+  */
+-void
+-RemovePgTempFiles(void)
++void RemovePgTempFiles(void)
+ {
+-	char		temp_path[MAXPGPATH + sizeof(PG_TBLSPC_DIR) + sizeof(TABLESPACE_VERSION_DIRECTORY) + sizeof(PG_TEMP_FILES_DIR)];
+-	DIR		   *spc_dir;
++	char temp_path[MAXPGPATH + sizeof(PG_TBLSPC_DIR) + sizeof(TABLESPACE_VERSION_DIRECTORY) + sizeof(PG_TEMP_FILES_DIR)];
++	DIR *spc_dir;
+ 	struct dirent *spc_de;
+ 
+ 	/*
+@@ -3391,12 +3349,11 @@ RemovePgTempFiles(void)
+  * (These two flags could be replaced by one, but it seems clearer to keep
+  * them separate.)
+  */
+-void
+-RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
++void RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
+ {
+-	DIR		   *temp_dir;
++	DIR *temp_dir;
+ 	struct dirent *temp_de;
+-	char		rm_path[MAXPGPATH * 2];
++	char rm_path[MAXPGPATH * 2];
+ 
+ 	temp_dir = AllocateDir(tmpdirname);
+ 
+@@ -3417,7 +3374,7 @@ RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
+ 					PG_TEMP_FILE_PREFIX,
+ 					strlen(PG_TEMP_FILE_PREFIX)) == 0)
+ 		{
+-			PGFileType	type = get_dirent_type(rm_path, temp_de, false, LOG);
++			PGFileType type = get_dirent_type(rm_path, temp_de, false, LOG);
+ 
+ 			if (type == PGFILETYPE_ERROR)
+ 				continue;
+@@ -3454,9 +3411,9 @@ RemovePgTempFilesInDir(const char *tmpdirname, bool missing_ok, bool unlink_all)
+ static void
+ RemovePgTempRelationFiles(const char *tsdirname)
+ {
+-	DIR		   *ts_dir;
++	DIR *ts_dir;
+ 	struct dirent *de;
+-	char		dbspace_path[MAXPGPATH * 2];
++	char dbspace_path[MAXPGPATH * 2];
+ 
+ 	ts_dir = AllocateDir(tsdirname);
+ 
+@@ -3482,9 +3439,9 @@ RemovePgTempRelationFiles(const char *tsdirname)
+ static void
+ RemovePgTempRelationFilesInDbspace(const char *dbspacedirname)
+ {
+-	DIR		   *dbspace_dir;
++	DIR *dbspace_dir;
+ 	struct dirent *de;
+-	char		rm_path[MAXPGPATH * 2];
++	char rm_path[MAXPGPATH * 2];
+ 
+ 	dbspace_dir = AllocateDir(dbspacedirname);
+ 
+@@ -3507,24 +3464,23 @@ RemovePgTempRelationFilesInDbspace(const char *dbspacedirname)
+ }
+ 
+ /* t<digits>_<digits>, or t<digits>_<digits>_<forkname> */
+-bool
+-looks_like_temp_rel_name(const char *name)
++bool looks_like_temp_rel_name(const char *name)
+ {
+-	int			pos;
+-	int			savepos;
++	int pos;
++	int savepos;
+ 
+ 	/* Must start with "t". */
+ 	if (name[0] != 't')
+ 		return false;
+ 
+ 	/* Followed by a non-empty string of digits and then an underscore. */
+-	for (pos = 1; isdigit((unsigned char) name[pos]); ++pos)
++	for (pos = 1; isdigit((unsigned char)name[pos]); ++pos)
+ 		;
+ 	if (pos == 1 || name[pos] != '_')
+ 		return false;
+ 
+ 	/* Followed by another nonempty string of digits. */
+-	for (savepos = ++pos; isdigit((unsigned char) name[pos]); ++pos)
++	for (savepos = ++pos; isdigit((unsigned char)name[pos]); ++pos)
+ 		;
+ 	if (savepos == pos)
+ 		return false;
+@@ -3532,7 +3488,7 @@ looks_like_temp_rel_name(const char *name)
+ 	/* We might have _forkname or .segment or both. */
+ 	if (name[pos] == '_')
+ 	{
+-		int			forkchar = forkname_chars(&name[pos + 1], NULL);
++		int forkchar = forkname_chars(&name[pos + 1], NULL);
+ 
+ 		if (forkchar <= 0)
+ 			return false;
+@@ -3540,9 +3496,9 @@ looks_like_temp_rel_name(const char *name)
+ 	}
+ 	if (name[pos] == '.')
+ 	{
+-		int			segchar;
++		int segchar;
+ 
+-		for (segchar = 1; isdigit((unsigned char) name[pos + segchar]); ++segchar)
++		for (segchar = 1; isdigit((unsigned char)name[pos + segchar]); ++segchar)
+ 			;
+ 		if (segchar <= 1)
+ 			return false;
+@@ -3559,7 +3515,7 @@ looks_like_temp_rel_name(const char *name)
+ static void
+ do_syncfs(const char *path)
+ {
+-	int			fd;
++	int fd;
+ 
+ 	ereport_startup_progress("syncing data directory (syncfs), elapsed time: %ld.%02d s, current path: %s",
+ 							 path);
+@@ -3602,10 +3558,9 @@ do_syncfs(const char *path)
+  *
+  * Note we assume we're chdir'd into PGDATA to begin with.
+  */
+-void
+-SyncDataDirectory(void)
++void SyncDataDirectory(void)
+ {
+-	bool		xlog_is_symlink;
++	bool xlog_is_symlink;
+ 
+ 	/* We can skip this whole thing if fsync is disabled. */
+ 	if (!enableFsync)
+@@ -3632,7 +3587,7 @@ SyncDataDirectory(void)
+ #ifdef HAVE_SYNCFS
+ 	if (recovery_init_sync_method == DATA_DIR_SYNC_METHOD_SYNCFS)
+ 	{
+-		DIR		   *dir;
++		DIR *dir;
+ 		struct dirent *de;
+ 
+ 		/*
+@@ -3652,7 +3607,7 @@ SyncDataDirectory(void)
+ 		dir = AllocateDir(PG_TBLSPC_DIR);
+ 		while ((de = ReadDirExtended(dir, PG_TBLSPC_DIR, LOG)))
+ 		{
+-			char		path[MAXPGPATH];
++			char path[MAXPGPATH];
+ 
+ 			if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+ 				continue;
+@@ -3666,7 +3621,7 @@ SyncDataDirectory(void)
+ 			do_syncfs("pg_wal");
+ 		return;
+ 	}
+-#endif							/* !HAVE_SYNCFS */
++#endif /* !HAVE_SYNCFS */
+ 
+ #ifdef PG_FLUSH_DATA_WORKS
+ 	/* Prepare to report progress of the pre-fsync phase. */
+@@ -3718,18 +3673,18 @@ SyncDataDirectory(void)
+  */
+ static void
+ walkdir(const char *path,
+-		void (*action) (const char *fname, bool isdir, int elevel),
++		void (*action)(const char *fname, bool isdir, int elevel),
+ 		bool process_symlinks,
+ 		int elevel)
+ {
+-	DIR		   *dir;
++	DIR *dir;
+ 	struct dirent *de;
+ 
+ 	dir = AllocateDir(path);
+ 
+ 	while ((de = ReadDirExtended(dir, path, elevel)) != NULL)
+ 	{
+-		char		subpath[MAXPGPATH * 2];
++		char subpath[MAXPGPATH * 2];
+ 
+ 		CHECK_FOR_INTERRUPTS();
+ 
+@@ -3741,24 +3696,24 @@ walkdir(const char *path,
+ 
+ 		switch (get_dirent_type(subpath, de, process_symlinks, elevel))
+ 		{
+-			case PGFILETYPE_REG:
+-				(*action) (subpath, false, elevel);
+-				break;
+-			case PGFILETYPE_DIR:
+-				walkdir(subpath, action, false, elevel);
+-				break;
+-			default:
++		case PGFILETYPE_REG:
++			(*action)(subpath, false, elevel);
++			break;
++		case PGFILETYPE_DIR:
++			walkdir(subpath, action, false, elevel);
++			break;
++		default:
+ 
+-				/*
+-				 * Errors are already reported directly by get_dirent_type(),
+-				 * and any remaining symlinks and unknown file types are
+-				 * ignored.
+-				 */
+-				break;
++			/*
++			 * Errors are already reported directly by get_dirent_type(),
++			 * and any remaining symlinks and unknown file types are
++			 * ignored.
++			 */
++			break;
+ 		}
+ 	}
+ 
+-	FreeDir(dir);				/* we ignore any error here */
++	FreeDir(dir); /* we ignore any error here */
+ 
+ 	/*
+ 	 * It's important to fsync the destination directory itself as individual
+@@ -3767,10 +3722,9 @@ walkdir(const char *path,
+ 	 * might not be robust against that.
+ 	 */
+ 	if (dir)
+-		(*action) (path, true, elevel);
++		(*action)(path, true, elevel);
+ }
+ 
+-
+ /*
+  * Hint to the OS that it should get ready to fsync() this file.
+  *
+@@ -3782,7 +3736,7 @@ walkdir(const char *path,
+ static void
+ pre_sync_fname(const char *fname, bool isdir, int elevel)
+ {
+-	int			fd;
++	int fd;
+ 
+ 	/* Don't try to flush directories, it'll likely just fail */
+ 	if (isdir)
+@@ -3815,7 +3769,7 @@ pre_sync_fname(const char *fname, bool isdir, int elevel)
+ 				 errmsg("could not close file \"%s\": %m", fname)));
+ }
+ 
+-#endif							/* PG_FLUSH_DATA_WORKS */
++#endif /* PG_FLUSH_DATA_WORKS */
+ 
+ static void
+ datadir_fsync_fname(const char *fname, bool isdir, int elevel)
+@@ -3855,12 +3809,11 @@ unlink_if_exists_fname(const char *fname, bool isdir, int elevel)
+  *
+  * Returns 0 if the operation succeeded, -1 otherwise.
+  */
+-int
+-fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel)
++int fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel)
+ {
+-	int			fd;
+-	int			flags;
+-	int			returncode;
++	int fd;
++	int flags;
++	int returncode;
+ 
+ 	/*
+ 	 * Some OSs require directories to be opened read-only whereas other
+@@ -3901,11 +3854,11 @@ fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel)
+ 	 */
+ 	if (returncode != 0 && !(isdir && (errno == EBADF || errno == EINVAL)))
+ 	{
+-		int			save_errno;
++		int save_errno;
+ 
+ 		/* close file upon error, might not be in transaction context */
+ 		save_errno = errno;
+-		(void) CloseTransientFile(fd);
++		(void)CloseTransientFile(fd);
+ 		errno = save_errno;
+ 
+ 		ereport(elevel,
+@@ -3934,7 +3887,7 @@ fsync_fname_ext(const char *fname, bool isdir, bool ignore_perm, int elevel)
+ static int
+ fsync_parent_path(const char *fname, int elevel)
+ {
+-	char		parentpath[MAXPGPATH];
++	char parentpath[MAXPGPATH];
+ 
+ 	strlcpy(parentpath, fname, MAXPGPATH);
+ 	get_parent_directory(parentpath);
+@@ -3971,8 +3924,7 @@ fsync_parent_path(const char *fname, int elevel)
+  * permissions in a PostgreSQL data directory could cause backups and other
+  * processes to fail.
+  */
+-int
+-MakePGDirectory(const char *directoryName)
++int MakePGDirectory(const char *directoryName)
+ {
+ 	return mkdir(directoryName, pg_dir_create_mode);
+ }
+@@ -3994,17 +3946,15 @@ MakePGDirectory(const char *directoryName)
+  * Any code that reports a failure from fsync() or related functions should
+  * filter the error level with this function.
+  */
+-int
+-data_sync_elevel(int elevel)
++int data_sync_elevel(int elevel)
+ {
+ 	return data_sync_retry ? elevel : PANIC;
+ }
+ 
+-bool
+-check_debug_io_direct(char **newval, void **extra, GucSource source)
++bool check_debug_io_direct(char **newval, void **extra, GucSource source)
+ {
+-	bool		result = true;
+-	int			flags;
++	bool result = true;
++	int flags;
+ 
+ #if PG_O_DIRECT == 0
+ 	if (strcmp(*newval, "") != 0)
+@@ -4015,9 +3965,9 @@ check_debug_io_direct(char **newval, void **extra, GucSource source)
+ 	}
+ 	flags = 0;
+ #else
+-	List	   *elemlist;
+-	ListCell   *l;
+-	char	   *rawstring;
++	List *elemlist;
++	ListCell *l;
++	char *rawstring;
+ 
+ 	/* Need a modifiable copy of string */
+ 	rawstring = pstrdup(*newval);
+@@ -4032,9 +3982,9 @@ check_debug_io_direct(char **newval, void **extra, GucSource source)
+ 	}
+ 
+ 	flags = 0;
+-	foreach(l, elemlist)
++	foreach (l, elemlist)
+ 	{
+-		char	   *item = (char *) lfirst(l);
++		char *item = (char *)lfirst(l);
+ 
+ 		if (pg_strcasecmp(item, "data") == 0)
+ 			flags |= IO_DIRECT_DATA;
+@@ -4082,15 +4032,14 @@ check_debug_io_direct(char **newval, void **extra, GucSource source)
+ 	*extra = guc_malloc(LOG, sizeof(int));
+ 	if (!*extra)
+ 		return false;
+-	*((int *) *extra) = flags;
++	*((int *)*extra) = flags;
+ 
+ 	return result;
+ }
+ 
+-void
+-assign_debug_io_direct(const char *newval, void *extra)
++void assign_debug_io_direct(const char *newval, void *extra)
+ {
+-	int		   *flags = (int *) extra;
++	int *flags = (int *)extra;
+ 
+ 	io_direct_flags = *flags;
+ }
+@@ -4100,8 +4049,8 @@ assign_debug_io_direct(const char *newval, void *extra)
+ static void
+ ResOwnerReleaseFile(Datum res)
+ {
+-	File		file = (File) DatumGetInt32(res);
+-	Vfd		   *vfdP;
++	File file = (File)DatumGetInt32(res);
++	Vfd *vfdP;
+ 
+ 	Assert(FileIsValid(file));
+ 
+diff --git a/src/backend/storage/uring_config.h b/src/backend/storage/uring_config.h
+new file mode 100644
+index 00000000000..b0c9bc9f089
+--- /dev/null
++++ b/src/backend/storage/uring_config.h
+@@ -0,0 +1,89 @@
++#ifndef URING_CFG_H
++#define URING_CFG_H
++
++// enum definitions
++#define SETUP_NONE 0
++#define SETUP_COOP 1
++#define SETUP_SQPOLL 2
++
++// uring behaviour
++// #define SETUP_MODE SETUP_SQPOLL
++// #define IO_POLL 1
++// #define FIXED_FDS 1
++// #define FIXED_BUFS 1 // Disabled
++// #define SHARE_SQ 1   // share SQPOLL thread between rings
++
++#define RUN_MODE 6
++
++#if RUN_MODE == 0
++#define SETUP_MODE SETUP_NONE
++#define IO_POLL 0
++#define FIXED_FDS 0
++#define FIXED_BUFS 0
++#define SHARE_SQ 0
++
++#elif RUN_MODE == 1
++#define SETUP_MODE SETUP_COOP
++#define IO_POLL 0
++#define FIXED_FDS 0
++#define FIXED_BUFS 0
++#define SHARE_SQ 0
++
++#elif RUN_MODE == 2
++#define SETUP_MODE SETUP_COOP
++#define IO_POLL 0
++#define FIXED_FDS 0
++#define FIXED_BUFS 1
++#define SHARE_SQ 0
++
++#elif RUN_MODE == 3
++#define SETUP_MODE SETUP_COOP
++#define IO_POLL 1
++#define FIXED_FDS 0
++#define FIXED_BUFS 1
++#define SHARE_SQ 0
++
++#elif RUN_MODE == 4
++#define SETUP_MODE SETUP_SQPOLL
++#define IO_POLL 1
++#define FIXED_FDS 1
++#define FIXED_BUFS 1
++#define SHARE_SQ 0
++
++#elif RUN_MODE == 5
++#define SETUP_MODE SETUP_SQPOLL
++#define IO_POLL 1
++#define FIXED_FDS 1
++#define FIXED_BUFS 1
++#define SHARE_SQ 1
++
++#elif RUN_MODE == 6
++#define SETUP_MODE SETUP_SQPOLL
++#define IO_POLL 0
++#define FIXED_FDS 1
++#define FIXED_BUFS 1
++#define SHARE_SQ 1
++
++#elif RUN_MODE == 7
++#define SETUP_MODE SETUP_NONE
++#define IO_POLL 0
++#define FIXED_FDS 0
++#define FIXED_BUFS 1
++#define SHARE_SQ 0
++
++#else
++#error "Invalid RUN_MODE"
++
++#endif
++
++// debugging
++#define LOG_READS 0
++#define LOG_OPENS 0
++
++// assertions
++
++#if SETUP_MODE == SETUP_SQPOLL && !FIXED_FDS
++#error "If SETUP_MODE is SQPOLL, then FIXED_FDS must be true (1)."
++#endif
++
++#endif // URING_CFG_H
+diff --git a/src/include/storage/aio.h b/src/include/storage/aio.h
+index 2933eea0649..44d0564fcb8 100644
+--- a/src/include/storage/aio.h
++++ b/src/include/storage/aio.h
+@@ -21,12 +21,16 @@
+ #include "storage/aio_types.h"
+ #include "storage/procnumber.h"
+ 
+-
+ /* io_uring is incompatible with EXEC_BACKEND */
+ #if defined(USE_LIBURING) && !defined(EXEC_BACKEND)
+ #define IOMETHOD_IO_URING_ENABLED
+-#endif
+ 
++#else
++// overwrite
++#define IOMETHOD_IO_URING_ENABLED
++#define HAVE_LIBURING_QUEUE_INIT_MEM
++#define IORING_SETUP_NO_MMAP
++#endif
+ 
+ /* Enum for io_method GUC. */
+ typedef enum IoMethod
+@@ -36,12 +40,11 @@ typedef enum IoMethod
+ #ifdef IOMETHOD_IO_URING_ENABLED
+ 	IOMETHOD_IO_URING,
+ #endif
+-}			IoMethod;
++} IoMethod;
+ 
+ /* We'll default to worker based execution. */
+ #define DEFAULT_IO_METHOD IOMETHOD_WORKER
+ 
+-
+ /*
+  * Flags for an IO that can be set with pgaio_io_set_flag().
+  */
+@@ -104,8 +107,7 @@ typedef enum PgAioOp
+ 	 **/
+ } PgAioOp;
+ 
+-#define PGAIO_OP_COUNT	(PGAIO_OP_WRITEV + 1)
+-
++#define PGAIO_OP_COUNT (PGAIO_OP_WRITEV + 1)
+ 
+ /*
+  * On what is IO being performed?
+@@ -122,7 +124,6 @@ typedef enum PgAioTargetID
+ 
+ #define PGAIO_TID_COUNT (PGAIO_TID_SMGR + 1)
+ 
+-
+ /*
+  * Data necessary for support IO operations (see PgAioOp).
+  *
+@@ -135,20 +136,19 @@ typedef union
+ {
+ 	struct
+ 	{
+-		int			fd;
+-		uint16		iov_length;
+-		uint64		offset;
+-	}			read;
++		int fd;
++		uint16 iov_length;
++		uint64 offset;
++	} read;
+ 
+ 	struct
+ 	{
+-		int			fd;
+-		uint16		iov_length;
+-		uint64		offset;
+-	}			write;
++		int fd;
++		uint16 iov_length;
++		uint64 offset;
++	} write;
+ } PgAioOpData;
+ 
+-
+ /*
+  * Information the object that IO is executed on. Mostly callbacks that
+  * operate on PgAioTargetData.
+@@ -161,16 +161,15 @@ struct PgAioTargetInfo
+ 	 * To support executing using worker processes, the file descriptor for an
+ 	 * IO may need to be reopened in a different process.
+ 	 */
+-	void		(*reopen) (PgAioHandle *ioh);
++	void (*reopen)(PgAioHandle *ioh);
+ 
+ 	/* describe the target of the IO, used for log messages and views */
+-	char	   *(*describe_identity) (const PgAioTargetData *sd);
++	char *(*describe_identity)(const PgAioTargetData *sd);
+ 
+ 	/* name of the target, used in log messages / views */
+ 	const char *name;
+ };
+ 
+-
+ /*
+  * IDs for callbacks that can be registered on an IO.
+  *
+@@ -200,14 +199,13 @@ typedef enum PgAioHandleCallbackID
+ 	PGAIO_HCB_LOCAL_BUFFER_READV,
+ } PgAioHandleCallbackID;
+ 
+-#define PGAIO_HCB_MAX	PGAIO_HCB_LOCAL_BUFFER_READV
++#define PGAIO_HCB_MAX PGAIO_HCB_LOCAL_BUFFER_READV
+ StaticAssertDecl(PGAIO_HCB_MAX < (1 << PGAIO_RESULT_ID_BITS),
+ 				 "PGAIO_HCB_MAX is too big for PGAIO_RESULT_ID_BITS");
+ 
+-
+-typedef void (*PgAioHandleCallbackStage) (PgAioHandle *ioh, uint8 cb_flags);
+-typedef PgAioResult (*PgAioHandleCallbackComplete) (PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_flags);
+-typedef void (*PgAioHandleCallbackReport) (PgAioResult result, const PgAioTargetData *target_data, int elevel);
++typedef void (*PgAioHandleCallbackStage)(PgAioHandle *ioh, uint8 cb_flags);
++typedef PgAioResult (*PgAioHandleCallbackComplete)(PgAioHandle *ioh, PgAioResult prior_result, uint8 cb_flags);
++typedef void (*PgAioHandleCallbackReport)(PgAioResult result, const PgAioTargetData *target_data, int elevel);
+ 
+ /* typedef is in aio_types.h */
+ struct PgAioHandleCallbacks
+@@ -258,15 +256,11 @@ struct PgAioHandleCallbacks
+ 	PgAioHandleCallbackReport report;
+ };
+ 
+-
+-
+ /*
+  * How many callbacks can be registered for one IO handle. Currently we only
+  * need two, but it's not hard to imagine needing a few more.
+  */
+-#define PGAIO_HANDLE_MAX_CALLBACKS	4
+-
+-
++#define PGAIO_HANDLE_MAX_CALLBACKS 4
+ 
+ /* --------------------------------------------------------------------------------
+  * IO Handles
+@@ -284,14 +278,14 @@ extern void pgaio_io_release_resowner(struct dlist_node *ioh_node, bool on_error
+ 
+ extern void pgaio_io_set_flag(PgAioHandle *ioh, PgAioHandleFlags flag);
+ 
+-extern int	pgaio_io_get_id(PgAioHandle *ioh);
++extern int pgaio_io_get_id(PgAioHandle *ioh);
+ extern ProcNumber pgaio_io_get_owner(PgAioHandle *ioh);
+ 
+ extern void pgaio_io_get_wref(PgAioHandle *ioh, PgAioWaitRef *iow);
+ 
+ /* functions in aio_io.c */
+ struct iovec;
+-extern int	pgaio_io_get_iovec(PgAioHandle *ioh, struct iovec **iov);
++extern int pgaio_io_get_iovec(PgAioHandle *ioh, struct iovec **iov);
+ 
+ extern PgAioOp pgaio_io_get_op(PgAioHandle *ioh);
+ extern PgAioOpData *pgaio_io_get_op_data(PgAioHandle *ioh);
+@@ -314,8 +308,6 @@ extern void pgaio_io_set_handle_data_64(PgAioHandle *ioh, uint64 *data, uint8 le
+ extern void pgaio_io_set_handle_data_32(PgAioHandle *ioh, uint32 *data, uint8 len);
+ extern uint64 *pgaio_io_get_handle_data(PgAioHandle *ioh, uint8 *len);
+ 
+-
+-
+ /* --------------------------------------------------------------------------------
+  * IO Wait References
+  * --------------------------------------------------------------------------------
+@@ -323,13 +315,11 @@ extern uint64 *pgaio_io_get_handle_data(PgAioHandle *ioh, uint8 *len);
+ 
+ extern void pgaio_wref_clear(PgAioWaitRef *iow);
+ extern bool pgaio_wref_valid(PgAioWaitRef *iow);
+-extern int	pgaio_wref_get_id(PgAioWaitRef *iow);
++extern int pgaio_wref_get_id(PgAioWaitRef *iow);
+ 
+ extern void pgaio_wref_wait(PgAioWaitRef *iow);
+ extern bool pgaio_wref_check_done(PgAioWaitRef *iow);
+ 
+-
+-
+ /* --------------------------------------------------------------------------------
+  * IO Result
+  * --------------------------------------------------------------------------------
+@@ -338,8 +328,6 @@ extern bool pgaio_wref_check_done(PgAioWaitRef *iow);
+ extern void pgaio_result_report(PgAioResult result, const PgAioTargetData *target_data,
+ 								int elevel);
+ 
+-
+-
+ /* --------------------------------------------------------------------------------
+  * Actions on multiple IOs.
+  * --------------------------------------------------------------------------------
+@@ -350,8 +338,6 @@ extern void pgaio_exit_batchmode(void);
+ extern void pgaio_submit_staged(void);
+ extern bool pgaio_have_staged(void);
+ 
+-
+-
+ /* --------------------------------------------------------------------------------
+  * Other
+  * --------------------------------------------------------------------------------
+@@ -359,11 +345,8 @@ extern bool pgaio_have_staged(void);
+ 
+ extern void pgaio_closing_fd(int fd);
+ 
+-
+-
+ /* GUCs */
+ extern PGDLLIMPORT int io_method;
+ extern PGDLLIMPORT int io_max_concurrency;
+ 
+-
+-#endif							/* AIO_H */
++#endif /* AIO_H */
+-- 
+2.51.0
+

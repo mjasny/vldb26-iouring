@@ -1,0 +1,4 @@
+CompileFlags:
+  Add: [-stdlib=libc++, -std=c++23]
+  CompilationDatabase: build/       # Search build/ directory for compile_commands.json
+

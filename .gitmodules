@@ -1,0 +1,12 @@
+[submodule "distexprunner"]
+	path = distexprunner
+	url = git@github.com:mjasny/distexprunner.git
+[submodule "vmcache"]
+	path = vmcache
+	url = https://github.com/viktorleis/vmcache
+[submodule "liburing"]
+	path = libs/liburing
+	url = git@github.com:axboe/liburing.git
+[submodule "postgresql"]
+	path = postgresql
+	url = https://git.postgresql.org/git/postgresql.git
