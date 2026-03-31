@@ -282,6 +282,7 @@ add_vert_arrow <- function(
   p, data, x, y,
   from, to, label,
   x_value      = NULL,
+  pad_h        = 0,
   colour       = "black",
   arrow_len    = grid::unit(4, "pt"),
   linewidth    = 0.5,
@@ -302,6 +303,8 @@ add_vert_arrow <- function(
   if (!all(c(x, y) %in% names(data))) stop("`x` and `y` must be in `data`.")
   if (pad_top  < 0 || pad_bottom < 0 || pad_top >= 1 || pad_bottom >= 1)
     stop("`pad_top` and `pad_bottom` must be in [0, 1).")
+  if (!is.numeric(pad_h) || length(pad_h) != 1L || !is.finite(pad_h))
+    stop("`pad_h` must be one finite numeric value.")
 
   other_cols <- setdiff(names(data), c(x, y))
 
@@ -329,6 +332,14 @@ add_vert_arrow <- function(
     xs <- xs[ord]; ys <- ys[ord]
     keep <- !duplicated(xs, fromLast = TRUE)
     xs <- xs[keep]; ys <- ys[keep]
+    keep <- !is.na(xs) & !is.na(ys)
+    xs <- xs[keep]; ys <- ys[keep]
+    if (!length(xs)) {
+      return(NA_real_)
+    }
+    if (length(xs) == 1) {
+      return(ys[[1]])
+    }
     rule <- if (extrapolate) 2 else 1
     approx(xs, ys, xout = as_num(xout), rule = rule, ties = "ordered")$y
   }
@@ -371,15 +382,18 @@ add_vert_arrow <- function(
 
   y_new_low  <- ym - bottom_half
   y_new_high <- ym + top_half
+  ym_text    <- (y_new_low + y_new_high) / 2
+
+  draw_x <- shift_x_value(p, xv, pad_h)
 
   # annotation df (carry constant facets so it draws in correct panel)
   ann_df <- if (length(const_facets)) unique(data[const_facets])[1, , drop = FALSE] else data.frame()
-  ann_df$x     <- xv
+  ann_df$x     <- draw_x
   ann_df$y     <- y_new_low
-  ann_df$xend  <- xv
+  ann_df$xend  <- draw_x
   ann_df$yend  <- y_new_high
-  ann_df$xm    <- xv
-  ann_df$ym    <- ym
+  ann_df$xm    <- draw_x
+  ann_df$ym    <- ym_text
   ann_df$label <- label
 
   seg_args <- c(
@@ -414,6 +428,319 @@ add_vert_arrow <- function(
 }
 
 
+shift_x_value <- function(plot, x_value, pad_h = 0) {
+  if (pad_h == 0) {
+    return(x_value)
+  }
+
+  x_scale <- plot$scales$get_scales("x")
+  trans <- if (!is.null(x_scale)) x_scale$trans else NULL
+
+  if (inherits(x_value, "Date")) {
+    x_num <- as.numeric(x_value)
+    shifted_num <- if (!is.null(trans)) {
+      trans$inverse(trans$transform(x_num) + pad_h)
+    } else {
+      x_num + pad_h
+    }
+    return(as.Date(shifted_num, origin = "1970-01-01"))
+  }
+
+  if (inherits(x_value, c("POSIXct", "POSIXlt"))) {
+    x_num <- as.numeric(x_value)
+    shifted_num <- if (!is.null(trans)) {
+      trans$inverse(trans$transform(x_num) + pad_h)
+    } else {
+      x_num + pad_h
+    }
+    return(as.POSIXct(shifted_num, origin = "1970-01-01", tz = attr(x_value, "tzone")))
+  }
+
+  if (!is.numeric(x_value)) {
+    stop("`pad_h` currently only supports numeric/date x values.")
+  }
+
+  if (!is.null(trans)) {
+    return(trans$inverse(trans$transform(x_value) + pad_h))
+  }
+
+  x_value + pad_h
+}
+
+
+infer_plot_aes_name <- function(plot, aes_name) {
+  mapping_expr <- plot$mapping[[aes_name]]
+
+  if (is.null(mapping_expr)) {
+    for (layer in plot$layers) {
+      mapping_expr <- layer$mapping[[aes_name]]
+      if (!is.null(mapping_expr)) {
+        break
+      }
+    }
+  }
+
+  if (is.null(mapping_expr)) {
+    return(NULL)
+  }
+
+  rlang::as_label(mapping_expr)
+}
+
+
+infer_facet_columns <- function(plot) {
+  extract_vars <- function(x) {
+    if (is.null(x)) {
+      return(character())
+    }
+    if (rlang::is_quosure(x)) {
+      return(all.vars(rlang::get_expr(x)))
+    }
+    if (is.list(x)) {
+      return(unique(unlist(lapply(x, extract_vars), use.names = FALSE)))
+    }
+    character()
+  }
+
+  unique(c(
+    extract_vars(plot$facet$params$rows),
+    extract_vars(plot$facet$params$cols),
+    extract_vars(plot$facet$params$facets)
+  ))
+}
+
+
+relative_panel_position <- function(plot, data, axis, column, pos_frac, override_min = NULL, override_max = NULL) {
+  if (!is.numeric(pos_frac) || length(pos_frac) != 1L || !is.finite(pos_frac) || pos_frac < 0 || pos_frac > 1) {
+    stop("`pos_x`/`pos_y` must be one numeric value in [0, 1].")
+  }
+  if (!is.null(override_min) && (!is.numeric(override_min) || length(override_min) != 1L || !is.finite(override_min))) {
+    stop("`override_min` must be one finite numeric value.")
+  }
+  if (!is.null(override_max) && (!is.numeric(override_max) || length(override_max) != 1L || !is.finite(override_max))) {
+    stop("`override_max` must be one finite numeric value.")
+  }
+
+  scale_obj <- plot$scales$get_scales(axis)
+  trans <- if (!is.null(scale_obj)) scale_obj$trans else NULL
+
+  vec <- data[[column]]
+  keep <- !is.na(vec)
+  vec <- vec[keep]
+
+  if (!length(vec)) {
+    return(NA_real_)
+  }
+
+  if (inherits(vec, "Date")) {
+    vec_num <- as.numeric(vec)
+    if (!is.null(override_min)) vec_num <- c(vec_num, override_min)
+    if (!is.null(override_max)) vec_num <- c(vec_num, override_max)
+    if (!is.null(trans)) {
+      vec_t <- trans$transform(vec_num)
+      value_num <- trans$inverse(min(vec_t) + pos_frac * diff(range(vec_t)))
+    } else {
+      value_num <- min(vec_num) + pos_frac * diff(range(vec_num))
+    }
+    return(as.Date(value_num, origin = "1970-01-01"))
+  }
+
+  if (inherits(vec, c("POSIXct", "POSIXlt"))) {
+    vec_num <- as.numeric(vec)
+    if (!is.null(override_min)) vec_num <- c(vec_num, override_min)
+    if (!is.null(override_max)) vec_num <- c(vec_num, override_max)
+    if (!is.null(trans)) {
+      vec_t <- trans$transform(vec_num)
+      value_num <- trans$inverse(min(vec_t) + pos_frac * diff(range(vec_t)))
+    } else {
+      value_num <- min(vec_num) + pos_frac * diff(range(vec_num))
+    }
+    return(as.POSIXct(value_num, origin = "1970-01-01", tz = attr(vec, "tzone")))
+  }
+
+  if (!is.numeric(vec)) {
+    stop("`annotate_point()` only supports numeric/date x and y aesthetics.")
+  }
+
+  vec_num <- as.numeric(vec)
+  if (!is.null(override_min)) vec_num <- c(vec_num, override_min)
+  if (!is.null(override_max)) vec_num <- c(vec_num, override_max)
+  if (!is.null(trans)) {
+    vec_t <- trans$transform(vec_num)
+    return(trans$inverse(min(vec_t) + pos_frac * diff(range(vec_t))))
+  }
+
+  min(vec_num) + pos_frac * diff(range(vec_num))
+}
+
+
+transform_axis_values <- function(plot, data, axis, column, values) {
+  scale_obj <- plot$scales$get_scales(axis)
+  trans <- if (!is.null(scale_obj)) scale_obj$trans else NULL
+
+  vec <- data[[column]]
+  vec <- vec[!is.na(vec)]
+  if (!length(vec)) {
+    stop("Cannot transform values without panel data.")
+  }
+
+  if (inherits(vec, "Date")) {
+    range_num <- as.numeric(vec)
+    value_num <- as.numeric(values)
+    if (!is.null(trans)) {
+      return(list(
+        values = trans$transform(value_num),
+        range = range(trans$transform(range_num))
+      ))
+    }
+    return(list(values = value_num, range = range(range_num)))
+  }
+
+  if (inherits(vec, c("POSIXct", "POSIXlt"))) {
+    range_num <- as.numeric(vec)
+    value_num <- as.numeric(values)
+    if (!is.null(trans)) {
+      return(list(
+        values = trans$transform(value_num),
+        range = range(trans$transform(range_num))
+      ))
+    }
+    return(list(values = value_num, range = range(range_num)))
+  }
+
+  if (!is.numeric(vec)) {
+    stop("Only numeric/date axes are supported.")
+  }
+
+  range_num <- as.numeric(vec)
+  value_num <- as.numeric(values)
+  if (!is.null(trans)) {
+    return(list(
+      values = trans$transform(value_num),
+      range = range(trans$transform(range_num))
+    ))
+  }
+
+  list(values = value_num, range = range(range_num))
+}
+
+
+inverse_axis_values <- function(plot, axis, template, values_t) {
+  scale_obj <- plot$scales$get_scales(axis)
+  trans <- if (!is.null(scale_obj)) scale_obj$trans else NULL
+
+  values_num <- if (!is.null(trans)) trans$inverse(values_t) else values_t
+
+  if (inherits(template, "Date")) {
+    return(as.Date(values_num, origin = "1970-01-01"))
+  }
+  if (inherits(template, c("POSIXct", "POSIXlt"))) {
+    return(as.POSIXct(values_num, origin = "1970-01-01", tz = attr(template, "tzone")))
+  }
+
+  values_num
+}
+
+
+trim_segment_tip <- function(plot, data, x_col, y_col, x_text, y_text, x_point, y_point, point_padding) {
+  if (is.null(point_padding) || point_padding <= 0) {
+    return(list(x = x_point, y = y_point))
+  }
+
+  x_info <- transform_axis_values(plot, data, "x", x_col, c(x_text, x_point))
+  y_info <- transform_axis_values(plot, data, "y", y_col, c(y_text, y_point))
+
+  x_span <- diff(x_info$range)
+  y_span <- diff(y_info$range)
+  if (!is.finite(x_span) || x_span == 0) x_span <- 1
+  if (!is.finite(y_span) || y_span == 0) y_span <- 1
+
+  x_text_n <- (x_info$values[1] - x_info$range[1]) / x_span
+  x_point_n <- (x_info$values[2] - x_info$range[1]) / x_span
+  y_text_n <- (y_info$values[1] - y_info$range[1]) / y_span
+  y_point_n <- (y_info$values[2] - y_info$range[1]) / y_span
+
+  dx_n <- x_point_n - x_text_n
+  dy_n <- y_point_n - y_text_n
+  seg_len_n <- sqrt(dx_n^2 + dy_n^2)
+  if (!is.finite(seg_len_n) || seg_len_n == 0) {
+    return(list(x = x_point, y = y_point))
+  }
+
+  pad_n <- min(point_padding * 0.02, seg_len_n * 0.9)
+  x_end_n <- x_point_n - pad_n * dx_n / seg_len_n
+  y_end_n <- y_point_n - pad_n * dy_n / seg_len_n
+
+  x_end_t <- x_info$range[1] + x_end_n * x_span
+  y_end_t <- y_info$range[1] + y_end_n * y_span
+
+  list(
+    x = inverse_axis_values(plot, "x", x_point, x_end_t),
+    y = inverse_axis_values(plot, "y", y_point, y_end_t)
+  )
+}
+
+
+is_degenerate_segment <- function(plot, data, x_col, y_col, x0, y0, x1, y1, tol = 1e-9) {
+  x_info <- transform_axis_values(plot, data, "x", x_col, c(x0, x1))
+  y_info <- transform_axis_values(plot, data, "y", y_col, c(y0, y1))
+
+  dx <- x_info$values[2] - x_info$values[1]
+  dy <- y_info$values[2] - y_info$values[1]
+
+  isTRUE(is.finite(dx)) && isTRUE(is.finite(dy)) && abs(dx) < tol && abs(dy) < tol
+}
+
+
+add_gap_arrow <- function(
+  plot, data, condition,
+  x = NULL, y = NULL,
+  from, to, label,
+  ...
+) {
+  extra_args <- list(...)
+  filtered_data <- data %>% filter(!!enquo(condition))
+
+  if (!nrow(filtered_data)) {
+    stop("filtered_data is empty")
+  }
+
+  if (is.null(x)) {
+    x <- infer_plot_aes_name(plot, "x")
+  }
+  if (is.null(y)) {
+    y <- infer_plot_aes_name(plot, "y")
+  }
+  if (is.null(x) || is.null(y)) {
+    stop("Could not infer `x`/`y` from plot mapping. Pass them explicitly.")
+  }
+
+  if (is.null(extra_args$x_value)) {
+    x_values <- unique(filtered_data[[x]])
+    x_values <- x_values[!is.na(x_values)]
+    if (length(x_values) == 1) {
+      extra_args$x_value <- x_values[[1]]
+    }
+  }
+
+  do.call(
+    add_vert_arrow,
+    c(
+      list(
+        p = plot,
+        data = filtered_data,
+        x = x,
+        y = y,
+        from = from,
+        to = to,
+        label = label
+      ),
+      extra_args
+    )
+  )
+}
+
+
 annotate_points <- function(plot, data, condition, label,
                             point.padding=0.5,
                             ...) {
@@ -439,5 +766,111 @@ annotate_points <- function(plot, data, condition, label,
 }
 
 
+## Like annotate_points(), but uses a single fixed text label for one or more
+## matching points and places that text by panel-relative coordinates in [0, 1].
+annotate_point <- function(plot, data, condition, label,
+                           x = NULL, y = NULL,
+                           pos_x = 0.5,
+                           pos_y = 0.5,
+                           pos_from = c("facet", "condition"),
+                           override_y_max = NULL,
+                           curvature = 0,
+                           point.padding = 0.5,
+                           ...) {
+    filtered_data <- data %>% filter(!!enquo(condition))
 
+    if (nrow(filtered_data) == 0) {
+        stop("filtered_data is empty")
+    }
 
+    if (is.null(x)) {
+        x <- infer_plot_aes_name(plot, "x")
+    }
+    if (is.null(y)) {
+        y <- infer_plot_aes_name(plot, "y")
+    }
+    if (is.null(x) || is.null(y)) {
+        stop("Could not infer `x`/`y` from plot mapping. Pass them explicitly.")
+    }
+
+    pos_from <- match.arg(pos_from)
+    other_cols <- setdiff(names(filtered_data), c(x, y))
+    const_facets <- other_cols[sapply(other_cols, function(cl) length(unique(filtered_data[[cl]])) == 1)]
+    facet_cols <- intersect(infer_facet_columns(plot), names(filtered_data))
+    draw_facets <- if (length(facet_cols)) facet_cols else const_facets
+
+    panel_data <- if (pos_from == "condition") filtered_data else data
+    if (pos_from == "facet" && length(draw_facets)) {
+        for (cl in draw_facets) {
+            panel_data <- panel_data %>% filter(.data[[cl]] == filtered_data[[cl]][[1]])
+        }
+    }
+
+    text_x <- relative_panel_position(plot, panel_data, "x", x, pos_x)
+    text_y <- relative_panel_position(plot, panel_data, "y", y, pos_y, override_max = override_y_max)
+
+    text_data <- if (length(draw_facets)) unique(filtered_data[draw_facets])[1, , drop = FALSE] else data.frame()
+    text_data$x <- text_x
+    text_data$y <- text_y
+    text_data$label <- label
+
+    segment_data <- filtered_data
+    segment_data$x_text <- text_x
+    segment_data$y_text <- text_y
+    segment_data$x_point <- filtered_data[[x]]
+    segment_data$y_point <- filtered_data[[y]]
+    trimmed_tips <- purrr::pmap(
+        list(segment_data$x_text, segment_data$y_text, segment_data$x_point, segment_data$y_point),
+        function(x_text_i, y_text_i, x_point_i, y_point_i) {
+            trim_segment_tip(
+                plot = plot,
+                data = panel_data,
+                x_col = x,
+                y_col = y,
+                x_text = x_text_i,
+                y_text = y_text_i,
+                x_point = x_point_i,
+                y_point = y_point_i,
+                point_padding = point.padding
+            )
+        }
+    )
+    segment_data$x_end <- do.call(c, lapply(trimmed_tips, `[[`, "x"))
+    segment_data$y_end <- do.call(c, lapply(trimmed_tips, `[[`, "y"))
+    keep_segments <- !vapply(
+        seq_len(nrow(segment_data)),
+        function(i) {
+            is_degenerate_segment(
+                plot = plot,
+                data = panel_data,
+                x_col = x,
+                y_col = y,
+                x0 = segment_data$x_text[[i]],
+                y0 = segment_data$y_text[[i]],
+                x1 = segment_data$x_end[[i]],
+                y1 = segment_data$y_end[[i]]
+            )
+        },
+        logical(1)
+    )
+    segment_data <- segment_data[keep_segments, , drop = FALSE]
+
+    plot +
+        geom_curve(
+            data = segment_data,
+            mapping = aes(x = x_text, y = y_text, xend = x_end, yend = y_end),
+            inherit.aes = FALSE,
+            curvature = curvature,
+            colour = "black",
+            linewidth = 0.3,
+            arrow = arrow(length = unit(0.05, "npc"), type = "closed"),
+            arrow.fill = "white"
+        ) +
+        geom_text(
+            data = text_data,
+            mapping = aes(x = x, y = y, label = label),
+            inherit.aes = FALSE,
+            show.legend = FALSE,
+            ...
+        )
+}

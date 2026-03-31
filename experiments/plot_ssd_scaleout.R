@@ -8,6 +8,7 @@ library(scales)
 library(ggrepel)
 library(geomtextpath)
 library(patchwork)
+library(ggh4x)
 })
 source('./utils.R')
 
@@ -81,6 +82,39 @@ df <- df %>%
 
 
 
+spdk_ref <- read.csv(text='\
+num_threads,iops,flabel
+1,12530000,Read
+2,20650000,Read
+', comment='#')
+
+spdk_write_ref <- read.csv(text='\
+num_threads,iops,flabel
+1,7670000,Write
+2,7670000,Write
+', comment='#')
+
+fio_df <- read.csv("data/fio_windows.csv") %>%
+    filter(exitcode == 0) %>%
+    mutate(
+        flabel=case_when(
+            workload == "randread" ~ "Read",
+            workload == "randwrite" ~ "Write",
+        ),
+        num_threads=threads,
+        iops=case_when(
+            workload == "randread" ~ read_iops,
+            workload == "randwrite" ~ write_iops,
+        ),
+    ) %>%
+    filter(!is.na(flabel)) %>%
+    group_by(flabel, num_threads) %>%
+    summarize(
+        iops=mean(iops),
+        .groups='drop',
+    )
+    
+
 df_labels <- df %>%
   group_by(label, write) %>%
   mutate(
@@ -121,6 +155,8 @@ df %>%
 
 
 
+
+
 # SSD RandRead: max 2,450K IOPS
 # SSD RandWrite: max 310K IOPS
 
@@ -137,6 +173,46 @@ pal_fun <- hue_pal()
 colors = pal_fun(6)[idx]
 
 p <- ggplot(df, aes(y=iops, x=num_threads, color=label)) +
+
+    geom_line() +
+    geom_point(aes(shape=label)) +
+    geom_textline(
+        data=spdk_ref,
+        aes(x=num_threads, y=iops, label="SPDK\nbaseline"),
+        inherit.aes=FALSE,
+        color="darkgray",
+        lineheight=0.7,
+        linewidth=0.5,
+        size=2.25,
+        vjust=1.1,
+        text_smoothing=25,
+        show.legend=FALSE,
+    ) +
+    geom_point(
+        data=spdk_ref,
+        aes(x=num_threads, y=iops),
+        inherit.aes=FALSE,
+        color="darkgray",
+        size=1.5,
+        show.legend=FALSE,
+    ) +
+    geom_line(
+        data=spdk_write_ref,
+        aes(x=num_threads, y=iops),
+        inherit.aes=FALSE,
+        color="darkgray",
+        linewidth=0.5,
+        show.legend=FALSE,
+    ) +
+    geom_point(
+        data=spdk_write_ref,
+        aes(x=num_threads, y=iops),
+        inherit.aes=FALSE,
+        color="darkgray",
+        size=1.5,
+        show.legend=FALSE,
+    ) +
+
     geom_hline(
         data = hline_df,
         aes(yintercept = yint),
@@ -148,15 +224,13 @@ p <- ggplot(df, aes(y=iops, x=num_threads, color=label)) +
     geom_text(
         data = hline_df,
         aes(x = 1, y = yint, label = label),
-        hjust = 0.1, vjust = 1.4,
+        hjust = 0.1, vjust = -0.2,
         color = "black",
         size = 2.5, fontface = "bold",
         show.legend=F,
     ) +
 
 
-    geom_line() +
-    geom_point(aes(shape=label)) +
 
     #geom_textline(
     #    data=df_labels,
@@ -172,11 +246,6 @@ p <- ggplot(df, aes(y=iops, x=num_threads, color=label)) +
         trans='log',
     ) +
 
-    scale_y_continuous(
-        name="Throughput [IOPS]",
-        labels=function(x) sprintf("%.0fM", x/1e6),
-        #limit=c(0, 21.5e6),
-    ) +
     scale_color_manual(values = colors, drop = FALSE) +
     theme(
         #legend.position=c(.22,.65)
@@ -187,7 +256,21 @@ p <- ggplot(df, aes(y=iops, x=num_threads, color=label)) +
         color=guide_legend(title="Method:", nrow=1, byrow=T),
         shape=guide_legend(title="Method:", nrow=1, byrow=T),
     ) +
-    facet_wrap(. ~ flabel, scales='free_y') 
+    facet_wrap(. ~ flabel, scales='free_y') +
+    ggh4x::facetted_pos_scales(
+        y = list(
+            scale_y_continuous(
+                name="Throughput [IOPS]",
+                labels=function(x) sprintf("%.0fM", x/1e6),
+                limits=c(0, 22.5e6),
+            ),
+            scale_y_continuous(
+                name="Throughput [IOPS]",
+                labels=function(x) sprintf("%.0fM", x/1e6),
+                limits=c(0, 8.4e6),
+            )
+        )
+    )
 
 
 p <- add_vert_arrow(
@@ -234,3 +317,38 @@ fname=sprintf("out/%s.pdf", file)
 ggsave(file=fname, plot=p, device=cairo_pdf, width=dim[1], height=dim[2], units="mm")
 system(sprintf("pdfcrop \"%s\" \"%s\"", fname, fname), wait=T)
 
+p_win <- p +
+    geom_line(
+        data=fio_df,
+        aes(x=num_threads, y=iops),
+        inherit.aes=FALSE,
+        color="gray30",
+        linetype="dotdash",
+        linewidth=0.5,
+        show.legend=FALSE,
+    ) +
+    geom_point(
+        data=fio_df,
+        aes(x=num_threads, y=iops),
+        inherit.aes=FALSE,
+        color="gray30",
+        size=1.2,
+        show.legend=FALSE,
+    ) +
+    geom_textline(
+        data=fio_df,
+        aes(x=num_threads, y=iops, label="Windows (fio)"),
+        inherit.aes=FALSE,
+        color="gray30",
+        linetype="dotdash",
+        linewidth=0.5,
+        hjust=1.05,
+        vjust=-0.2,
+        text_smoothing=25,
+        size=2.8,
+        show.legend=FALSE,
+    )
+
+fname=sprintf("out/%s_win.pdf", file)
+ggsave(file=fname, plot=p_win, device=cairo_pdf, width=dim[1], height=dim[2], units="mm")
+system(sprintf("pdfcrop \"%s\" \"%s\"", fname, fname), wait=T)

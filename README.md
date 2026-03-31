@@ -1,4 +1,4 @@
-# io_uring for High-Performance DBMSs: When and How to Use It
+# High-Performance DBMSs with io_uring: When and How to Use It
 
 This repository contains the scripts, configurations, and plotting tooling required to reproduce all experiments reported in our paper.
 

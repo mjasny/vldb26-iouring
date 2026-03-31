@@ -136,18 +136,18 @@ private:
 
 
 template <>
-void Parser::parse_arg(std::string& arg, char& value) {
+inline void Parser::parse_arg(std::string& arg, char& value) {
     ensure(arg.size() == 1);
     value = arg[0];
 }
 
 template <>
-void Parser::parse_arg(std::string& arg, uint8_t& value) {
+inline void Parser::parse_arg(std::string& arg, uint8_t& value) {
     value = nostd::stou8(arg);
 }
 
 template <>
-void Parser::parse_arg(std::string& arg, bool& value) {
+inline void Parser::parse_arg(std::string& arg, bool& value) {
     std::transform(arg.begin(), arg.end(), arg.begin(), ::tolower);
     std::istringstream is(arg);
     is >> std::boolalpha >> value;

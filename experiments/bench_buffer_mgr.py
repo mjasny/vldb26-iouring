@@ -1,24 +1,39 @@
 from distexprunner import (
-    Action, Server, ServerList,  ProcessGroup, IterClassGen, ParameterGrid,
-    CSVGenerator, ComputedParam, Action,
-    reg_exp, run_on_all, log, sleep
+    Action,
+    Server,
+    ServerList,
+    ProcessGroup,
+    IterClassGen,
+    ParameterGrid,
+    CSVGenerator,
+    ComputedParam,
+    Action,
+    reg_exp,
+    run_on_all,
+    log,
+    sleep,
 )
 from utils import (
-    StdoutBuffer, AttrDict, StatsAggr,
-    set_kernel_version, set_mitigations, set_ssds,
-    fmt_args, PerfOut
+    StdoutBuffer,
+    AttrDict,
+    StatsAggr,
+    set_kernel_version,
+    set_mitigations,
+    set_ssds,
+    fmt_args,
+    PerfOut,
 )
 
 
 SERVER_PORT = 20000
-PROJECT_DIR = '~/ringding/'
+PROJECT_DIR = "~/ringding/"
 CLEAN_BUILD = False
 DEBUG = False
-BIN = 'buffer_mgr'
+BIN = "buffer_mgr"
 
 
 server_list = ServerList(
-    Server('fn01', '10.0.21.51', port=SERVER_PORT, ib_ip='192.168.1.11'),
+    Server("fn01", "10.0.21.51", port=SERVER_PORT, ib_ip="192.168.1.11"),
 )
 
 
@@ -26,15 +41,15 @@ server_list = ServerList(
 def compile(servers):
     servers.cd(PROJECT_DIR)
 
-    cmake_args = ''
+    cmake_args = ""
     if DEBUG:
-        cmake_args = '-DCMAKE_BUILD_TYPE=Debug'
+        cmake_args = "-DCMAKE_BUILD_TYPE=Debug"
 
     if CLEAN_BUILD:
-        run_on_all(servers, 'rm -rf build/')
+        run_on_all(servers, "rm -rf build/")
 
-    run_on_all(servers, f'cmake -B build/ {cmake_args}')
-    run_on_all(servers, f'make -C build/ -j {BIN}')
+    run_on_all(servers, f"cmake -B build/ {cmake_args}")
+    run_on_all(servers, f"make -C build/ -j {BIN}")
 
 
 reg_exp(servers=server_list.unique_by_ip, run_always=True)(set_kernel_version)
@@ -44,7 +59,7 @@ reg_exp(servers=server_list.unique_by_ip, run_always=True)(set_ssds)
 
 @reg_exp(servers=server_list, run_always=True, raise_on_rc=False)
 def pkill(servers):
-    run_on_all(servers, f'sudo pkill -f ./build/{BIN}', verify_rc=False)
+    run_on_all(servers, f"sudo pkill -f ./build/{BIN}", verify_rc=False)
 
 
 def bench_buffer_mgr(servers, csv_file, ssd_id, run, **kwargs):
@@ -62,8 +77,8 @@ def bench_buffer_mgr(servers, csv_file, ssd_id, run, **kwargs):
     for s in servers:
         csv = next(csvs)
         ssd_path = s.ssds[ssd_id]
-        if kwargs['nvme_cmds']:
-            ssd_path = ssd_path.replace('/dev/nvme', '/dev/ng')
+        if kwargs["nvme_cmds"]:
+            ssd_path = ssd_path.replace("/dev/nvme", "/dev/ng")
         csv.add_columns(
             kernel=s.kernel,
             mitigations=s.mitigations,
@@ -76,7 +91,7 @@ def bench_buffer_mgr(servers, csv_file, ssd_id, run, **kwargs):
             **kwargs,
         )
 
-        cmd = f'sudo ./build/{BIN} {fmt_args(args)}'
+        cmd = f"sudo ./build/{BIN} {fmt_args(args)}"
         procs.add(s.run_cmd(cmd, stdout=[csv, next(stats)]))
 
     procs.wait()
@@ -86,8 +101,7 @@ def bench_buffer_mgr(servers, csv_file, ssd_id, run, **kwargs):
 
 
 def run(params):
-    reg_exp(servers=server_list, params=params,
-            raise_on_rc=False)(bench_buffer_mgr)
+    reg_exp(servers=server_list, params=params, raise_on_rc=False)(bench_buffer_mgr)
 
 
 KiB = 1024
@@ -96,33 +110,28 @@ GiB = 1024 * MiB
 
 RUNS = 1
 params = ParameterGrid(
-    csv_file='data/bench_buffer_mgr.csv',
+    csv_file="data/bench_buffer_mgr.csv",
     run=range(RUNS),
     ssd_id=[0],
-
-    setup_mode=['defer'],
-    workload=['ycsb'],
+    setup_mode=["defer"],
+    workload=["ycsb"],
     submit_always=[False],
     sync_variant=[False],
     posix_variant=[False],
-
     duration=[10_000],
-    virt_size=[1*GiB],
+    virt_size=[1 * GiB],
     free_target=[0.10],
     page_table_factor=[2.5],
     concurrency=[128],
     evict_batch=[128],
-
     reg_ring=[False],
     reg_fds=[False],
     reg_bufs=[False],
     nvme_cmds=[False],
     iopoll=[False],
-
     ycsb_read_ratio=[0],
     ycsb_tuple_count=[10_000_000],
     tpcc_warehouses=[1],
-
     libaio=[False],
 )
 
@@ -187,49 +196,55 @@ tpcc_concurrency = 128  # 64 #32
 tpcc_duration = 200_000
 
 # TPC-C basic and concurrent
-run(params.update(
-    workload=['tpcc'],
-    concurrency=[1, tpcc_concurrency],
-    evict_batch=[tpcc_concurrency],
-    duration=[tpcc_duration],
-    ycsb_read_ratio=[''],
-    ycsb_tuple_count=[''],
-    tpcc_warehouses=[1, 100],
-    iopoll=[False, True],
-))
+run(
+    params.update(
+        workload=["tpcc"],
+        concurrency=[1, tpcc_concurrency],
+        evict_batch=[tpcc_concurrency],
+        duration=[tpcc_duration],
+        ycsb_read_ratio=[""],
+        ycsb_tuple_count=[""],
+        tpcc_warehouses=[1, 100],
+        iopoll=[False, True],
+    )
+)
 
 # TPC-C optimized
-run(params.update(
-    workload=['tpcc'],
-    concurrency=[tpcc_concurrency],
-    evict_batch=[tpcc_concurrency],
-    duration=[200_000],
-    reg_ring=[True],
-    reg_fds=[True],
-    reg_bufs=[True],
-    nvme_cmds=[False, True],
-    ycsb_read_ratio=[''],
-    ycsb_tuple_count=[''],
-    tpcc_warehouses=[1, 100],
-    iopoll=[False, True],
-))
+run(
+    params.update(
+        workload=["tpcc"],
+        concurrency=[tpcc_concurrency],
+        evict_batch=[tpcc_concurrency],
+        duration=[200_000],
+        reg_ring=[True],
+        reg_fds=[True],
+        reg_bufs=[True],
+        nvme_cmds=[False, True],
+        ycsb_read_ratio=[""],
+        ycsb_tuple_count=[""],
+        tpcc_warehouses=[1, 100],
+        iopoll=[False, True],
+    )
+)
 
 # SQPoll
-run(params.update(
-    workload=['tpcc'],
-    setup_mode=['sqpoll'],
-    concurrency=[tpcc_concurrency],
-    evict_batch=[tpcc_concurrency],
-    duration=[200_000],
-    reg_ring=[True],
-    reg_fds=[True],
-    reg_bufs=[True],
-    nvme_cmds=[True],
-    ycsb_read_ratio=[''],
-    ycsb_tuple_count=[''],
-    tpcc_warehouses=[1, 100],
-    iopoll=[False, True],
-))
+run(
+    params.update(
+        workload=["tpcc"],
+        setup_mode=["sqpoll"],
+        concurrency=[tpcc_concurrency],
+        evict_batch=[tpcc_concurrency],
+        duration=[200_000],
+        reg_ring=[True],
+        reg_fds=[True],
+        reg_bufs=[True],
+        nvme_cmds=[True],
+        ycsb_read_ratio=[""],
+        ycsb_tuple_count=[""],
+        tpcc_warehouses=[1, 100],
+        iopoll=[False, True],
+    )
+)
 
 # -------------------------
 
@@ -253,3 +268,47 @@ run(params.update(
 #    tpcc_warehouses=[1, 100],
 #    libaio=[True],
 # ))
+
+
+# -------------------------
+# R1D1 => no batching
+
+params = params.update(
+    csv_file="data/bench_buffer_mgr_nobatch.csv",
+    concurrency=[1],
+    evict_batch=[1],
+    sync_variant=[True],
+)
+run(params)
+
+
+# # Enable libaio for kuring reactor
+# run(params.update(
+#    libaio=[True],
+# ))
+
+params = params.update(
+    reg_ring=[True],
+    reg_fds=[True],
+)
+run(params)
+
+params = params.update(
+    reg_bufs=[True],
+)
+run(params)
+
+params = params.update(
+    nvme_cmds=[True],
+)
+run(params)
+
+params = params.update(
+    iopoll=[True],
+)
+run(params)
+
+params = params.update(
+    setup_mode=["sqpoll"],
+)
+run(params)

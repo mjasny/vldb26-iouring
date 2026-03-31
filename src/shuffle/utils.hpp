@@ -18,8 +18,8 @@
 
 int runCommand(const std::string& cmd, std::string* output = nullptr);
 
-bool get_ip_port(int fd, bool peer,
-                 int& family, std::string& ip, uint16_t& port) {
+inline bool get_ip_port(int fd, bool peer,
+                        int& family, std::string& ip, uint16_t& port) {
     sockaddr_storage ss{};
     socklen_t slen = sizeof(ss);
     int rc = peer
@@ -75,7 +75,7 @@ static bool sockaddr_equal(const sockaddr* a, const sockaddr* b) {
     return false;
 }
 
-std::string get_iface_name_from_fd(int fd) {
+inline std::string get_iface_name_from_fd(int fd) {
     // 1) If the socket was bound to a device, SO_BINDTODEVICE returns its name
     {
         char buf[IFNAMSIZ] = {0};
@@ -139,7 +139,7 @@ static inline bool is_wildcard_addr(const std::string& ip, int af) {
 }
 
 
-void assign_flow_to_rx_queue(int fd, int nic_queue) {
+inline void assign_flow_to_rx_queue(int fd, int nic_queue) {
     int fam_local = 0;
     std::string lip;
     uint16_t lport = 0;
@@ -213,7 +213,7 @@ void assign_flow_to_rx_queue(int fd, int nic_queue) {
 }
 
 
-int runCommand(const std::string& cmd, std::string* output) {
+inline int runCommand(const std::string& cmd, std::string* output) {
     FILE* pipe = popen(cmd.c_str(), "r");
     check_ptr(pipe);
 

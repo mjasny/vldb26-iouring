@@ -39,7 +39,7 @@ int nvme_get_info(int fd) {
 }
 
 
-inline void prep_nvme_read(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t len, uint64_t offset) {
+inline void prep_nvme_read(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t len, uint64_t offset, uint32_t nsid_value, uint32_t lba_shift_value) {
     // https://github.com/axboe/liburing/blob/master/test/io_uring_passthrough.c
 
     sqe->fd = fd;
@@ -52,8 +52,8 @@ inline void prep_nvme_read(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t
     struct nvme_uring_cmd* cmd = reinterpret_cast<struct nvme_uring_cmd*>(sqe->cmd);
     memset(cmd, 0, sizeof(struct nvme_uring_cmd));
 
-    uint64_t slba = offset >> lba_shift;
-    uint32_t nlb = (len >> lba_shift) - 1;
+    uint64_t slba = offset >> lba_shift_value;
+    uint32_t nlb = (len >> lba_shift_value) - 1;
 
     cmd->opcode = nvme_cmd_read;
     cmd->cdw10 = slba & 0xffffffff;
@@ -61,12 +61,12 @@ inline void prep_nvme_read(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t
     cmd->cdw12 = nlb;
     cmd->addr = reinterpret_cast<uintptr_t>(buf);
     cmd->data_len = len;
-    cmd->nsid = nsid;
+    cmd->nsid = nsid_value;
     // cmd->cdw13 = 1 << 6; // DSM Sequential Request
     // Data Set Management (DSM) Hints: Written in near future, seq. read, seq. write...
 }
 
-inline void prep_nvme_write(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t len, uint64_t offset) {
+inline void prep_nvme_write(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t len, uint64_t offset, uint32_t nsid_value, uint32_t lba_shift_value) {
     sqe->fd = fd;
     sqe->flags = 0;
 
@@ -79,8 +79,8 @@ inline void prep_nvme_write(struct io_uring_sqe* sqe, int fd, void* buf, uint32_
     struct nvme_uring_cmd* cmd = reinterpret_cast<struct nvme_uring_cmd*>(sqe->cmd);
     memset(cmd, 0, sizeof(struct nvme_uring_cmd));
 
-    uint64_t slba = offset >> lba_shift;
-    uint32_t nlb = (len >> lba_shift) - 1;
+    uint64_t slba = offset >> lba_shift_value;
+    uint32_t nlb = (len >> lba_shift_value) - 1;
     // Logger::info("nsid=", nsid, " lba_shift=", lba_shift, " slba=", slba);
 
     cmd->opcode = nvme_cmd_write;
@@ -89,6 +89,14 @@ inline void prep_nvme_write(struct io_uring_sqe* sqe, int fd, void* buf, uint32_
     cmd->cdw12 = nlb;
     cmd->addr = reinterpret_cast<uintptr_t>(buf);
     cmd->data_len = len;
-    cmd->nsid = nsid;
+    cmd->nsid = nsid_value;
     // cmd->cdw13 = 1 << 6; // DSM Sequential Request
+}
+
+inline void prep_nvme_read(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t len, uint64_t offset) {
+    prep_nvme_read(sqe, fd, buf, len, offset, nsid, lba_shift);
+}
+
+inline void prep_nvme_write(struct io_uring_sqe* sqe, int fd, void* buf, uint32_t len, uint64_t offset) {
+    prep_nvme_write(sqe, fd, buf, len, offset, nsid, lba_shift);
 }

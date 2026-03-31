@@ -91,6 +91,24 @@ void StatsPrinter::register_aggr(Scope& scope_guard, uint64_t& var, std::string 
     scope_guard.ids.push_back(id);
 }
 
+void StatsPrinter::reset_scope(const Scope& scope_guard) {
+    const std::lock_guard<std::mutex> guard(mutex);
+    for (auto id : scope_guard.ids) {
+        if (auto it = variables.find(id); it != variables.end()) {
+            auto current = it->second.var;
+            it->second.last = current;
+            it->second.last_diff = 0;
+            continue;
+        }
+        if (auto it = aggregates.find(id); it != aggregates.end()) {
+            auto current = it->second.var;
+            it->second.last = current;
+            it->second.last_diff = 0;
+            continue;
+        }
+    }
+}
+
 // private:
 void StatsPrinter::thread_fn(std::stop_token token) {
     uint64_t ts = 0;

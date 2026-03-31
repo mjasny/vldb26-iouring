@@ -1,6 +1,7 @@
 add_subdirectory(utils)
 add_subdirectory(shuffle)
 add_subdirectory(buffer_mgr)
+add_subdirectory(remotescan)
 
 
 set(SOURCES

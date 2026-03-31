@@ -1,11 +1,43 @@
 #include "hugepages.hpp"
 
 #include "utils/my_asserts.hpp"
+#include "utils/my_logger.hpp"
 
 #include <fcntl.h>
+#include <mutex>
+#include <numa.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+
+namespace {
+
+void log_hugepage_fallback_once(size_t size) {
+    static std::once_flag once;
+    std::call_once(once, [size] {
+        Logger::info("HugePages fallback to regular mmap size=", size);
+    });
+}
+
+void* mmap_with_fallback(size_t size) {
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (ptr != MAP_FAILED) {
+        memset(ptr, 0, size);
+        return ptr;
+    }
+
+    ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        throw std::runtime_error("mmap failed size=" + std::to_string(size));
+    }
+
+    madvise(ptr, size, MADV_HUGEPAGE);
+    memset(ptr, 0, size);
+    log_hugepage_fallback_once(size);
+    return ptr;
+}
+
+} // namespace
 
 
 HugePages::HugePages() : size(0), addr(nullptr) {}
@@ -21,26 +53,28 @@ HugePages::~HugePages() {
 
 void* HugePages::malloc(size_t size) {
     size = roundToPageSize(size);
-    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    if (ptr == MAP_FAILED) {
-        throw std::runtime_error("mallocHugePages failed size=" + std::to_string(size));
-    }
-
-    memset(ptr, 0, size);
-    return ptr;
+    return mmap_with_fallback(size);
 }
 
 
 void* HugePages::malloc_on_socket(size_t size, int numa_node) {
     size = roundToPageSize(size);
-    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    if (ptr == MAP_FAILED) {
-        throw std::runtime_error("mallocHugePages failed size=" + std::to_string(size));
-    }
+    void* ptr = mmap_with_fallback(size);
 
     numa_tonode_memory(ptr, size, numa_node);
+    return ptr;
+}
 
-    memset(ptr, 0, size);
+void* HugePages::malloc_interleaved(size_t size) {
+    size = roundToPageSize(size);
+    void* ptr = mmap_with_fallback(size);
+    // Distribute physical pages round-robin across all NUMA nodes (chiplets on
+    // single-socket EPYC). This gives all worker groups equal average latency
+    // instead of letting first-touch skew everything to one chiplet.
+    if (numa_available() >= 0) {
+        struct bitmask* all = numa_all_nodes_ptr;
+        numa_interleave_memory(ptr, size, all);
+    }
     return ptr;
 }
 

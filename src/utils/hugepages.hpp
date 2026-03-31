@@ -15,7 +15,25 @@ struct HugePages {
     HugePages(size_t size);
     HugePages(size_t size, int numa_node);
 
+
+    // HugePages(const HugePages& o) = delete;
+    // HugePages(HugePages&& o) : size(std::exchange(o.size, 0)), addr(std::exchange(o.addr, nullptr)) {}
+
+
     ~HugePages();
+
+    // A& operator=(const A& other) {
+    //     s = other.s;
+    //     std::cout << "copy assigned\n";
+    //     return *this;
+    // }
+
+    // A& operator=(A&& other) {
+    //     s = std::move(other.s);
+    //     std::cout << "move assigned\n";
+    //     return *this;
+    // }
+
 
     template <typename T>
     auto as() {
@@ -45,6 +63,9 @@ struct HugePages {
     static void* malloc_file_backed(size_t size);
 
     static void* malloc_on_socket(size_t size, int numa_node);
+    // Interleave physical pages across all NUMA nodes (chiplets). Use for large
+    // arrays accessed by all workers to avoid first-touch skew on EPYC.
+    static void* malloc_interleaved(size_t size);
 
     static void free(void* ptr, size_t size);
 

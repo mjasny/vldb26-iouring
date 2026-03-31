@@ -1,3 +1,4 @@
+add_subdirectory(mt)
 
 add_library(buffer_mgr_utils
     tpcc/random_generator.cpp

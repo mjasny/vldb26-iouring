@@ -73,6 +73,8 @@ struct StatsPrinter : Singleton<StatsPrinter> {
 
     void register_aggr(Scope& scope_guard, uint64_t& var, std::string name, bool diff = true);
 
+    void reset_scope(const Scope& scope_guard);
+
 private:
     void thread_fn(std::stop_token token);
 
